@@ -78,6 +78,8 @@ pub struct Config {
     pub aligned_memory_mapping: bool,
     /// Allowed [SBPFVersion]s
     pub enabled_sbpf_versions: std::ops::RangeInclusive<SBPFVersion>,
+    /// Use paged memory mapping
+    pub paged_memory_mapping: bool,
 }
 
 impl Config {
@@ -104,6 +106,7 @@ impl Default for Config {
             optimize_rodata: true,
             aligned_memory_mapping: true,
             enabled_sbpf_versions: SBPFVersion::V1..=SBPFVersion::V2,
+            paged_memory_mapping: false,
         }
     }
 }
@@ -216,15 +219,78 @@ impl DynamicAnalysis {
     }
 }
 
+/// Register for 32/64 bit arch
+#[derive(Copy, Clone, Debug)]
+pub enum Register {
+    /// Native 64-bit register
+    Native(u64),       
+    /// 32-bit register pair
+    Paged(Register64), 
+}
+
+impl Register {
+    /// converts a [Register] to a 64-bit integer representation
+    pub fn to_u64(&self) -> u64 {
+        match self {
+            Register::Native(val) => *val,
+            Register::Paged(reg64) => reg64.as_u64(),
+        }
+    }
+    
+    /// convert to [Register] from a 64-bit integer
+    pub fn from_u64(value: u64) -> Self {
+        if std::mem::size_of::<usize>() == 8 {
+            Register::Native(value)
+        } else {
+            Register::Paged(Register64::from_u64(value))
+        }
+    }
+    
+    /// Convert a [Register] to a 64 bit integer
+    pub fn into_u64(reg: Register) -> u64 {
+        reg.to_u64()
+    }
+}
+
+/// Structure to represent a 64-bit register using two 32-bit values.
+#[derive(Debug, Copy, Clone, Default)]
+pub struct Register64 {
+    low: u32,
+    high: u32,
+}
+
+impl Register64 {
+    fn as_u64(&self) -> u64 {
+        ((self.high as u64) << 32) | (self.low as u64)
+    }
+    
+    fn from_u64(value: u64) -> Self {
+        Register64 {
+            low: value as u32,
+            high: (value >> 32) as u32,
+        }
+    }
+}
+
 /// A call frame used for function calls inside the Interpreter
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CallFrame {
     /// The caller saved registers
-    pub caller_saved_registers: [u64; ebpf::SCRATCH_REGS],
+    pub caller_saved_registers: [Register; ebpf::SCRATCH_REGS],
     /// The callers frame pointer
-    pub frame_pointer: u64,
+    pub frame_pointer: Register,
     /// The target_pc of the exit instruction which returns back to the caller
-    pub target_pc: u64,
+    pub target_pc: Register,
+}
+
+impl Default for CallFrame {
+    fn default() -> Self {
+        Self {
+            caller_saved_registers: [Register::from_u64(0); ebpf::SCRATCH_REGS],
+            frame_pointer: Register::from_u64(0),
+            target_pc: Register::from_u64(0),
+        }
+    }
 }
 
 /// A virtual machine to run eBPF programs.
@@ -305,7 +371,7 @@ pub struct EbpfVm<'a, C: ContextObject> {
     /// Number of times the stop watch was used
     pub stopwatch_denominator: u64,
     /// Registers inlined
-    pub registers: [u64; 12],
+    pub registers: [Register; 12],
     /// ProgramResult inlined
     pub program_result: ProgramResult,
     /// MemoryMapping inlined
@@ -349,7 +415,7 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             due_insn_count: 0,
             stopwatch_numerator: 0,
             stopwatch_denominator: 0,
-            registers: [0u64; 12],
+            registers: [Register::from_u64(0); 12],
             program_result: ProgramResult::Ok(0),
             memory_mapping,
             call_frames: vec![CallFrame::default(); config.max_call_depth],
@@ -369,9 +435,10 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
     ) -> (u64, ProgramResult) {
         debug_assert!(Arc::ptr_eq(&self.loader, executable.get_loader()));
         // R1 points to beginning of input memory, R10 to the stack of the first frame, R11 is the pc (hidden)
-        self.registers[1] = ebpf::MM_INPUT_START;
-        self.registers[ebpf::FRAME_PTR_REG] = self.stack_pointer;
-        self.registers[11] = executable.get_entrypoint_instruction_offset() as u64;
+        self.registers[1] = Register::from_u64(ebpf::MM_INPUT_START);
+        self.registers[ebpf::FRAME_PTR_REG] = Register::from_u64(self.stack_pointer);
+        self.registers[11] =
+            Register::from_u64(executable.get_entrypoint_instruction_offset() as u64);
         let config = executable.get_config();
         let initial_insn_count = if config.enable_instruction_meter {
             self.context_object_pointer.get_remaining()
@@ -430,11 +497,11 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
                     .offset(get_runtime_environment_key() as isize)
                     .cast::<Self>()
             },
-            self.registers[1],
-            self.registers[2],
-            self.registers[3],
-            self.registers[4],
-            self.registers[5],
+            self.registers[1].to_u64(),
+            self.registers[2].to_u64(),
+            self.registers[3].to_u64(),
+            self.registers[4].to_u64(),
+            self.registers[5].to_u64(),
         );
     }
 }

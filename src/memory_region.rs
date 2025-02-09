@@ -3,7 +3,7 @@
 use crate::{
     aligned_memory::Pod,
     ebpf,
-    error::{EbpfError, ProgramResult},
+    error::{EbpfError, ProgramResult, StableResult},
     program::SBPFVersion,
     vm::Config,
 };
@@ -726,6 +726,233 @@ impl<'a> AlignedMemoryMapping<'a> {
     }
 }
 
+// Size of Pages, make sure this aligns to memory
+const PAGE_SIZE: usize = 4096;
+
+// Page Table Entry
+#[derive(Debug, Clone, Copy)]
+struct PageTableEntry {
+    physical_address: u32, // 32-bit physical address
+    valid: bool,
+}
+
+// Page Table (array of PageTableEntry)
+// The size of this array determines how many virtual pages we can map.
+// Adjust based on requirements.
+//Example, 4GB virtual address space / 4KB pages = 1048576 page entries to cover a 64-bit space
+const NUM_PAGE_TABLE_ENTRIES: usize = 1024 * 1024;
+
+#[derive(Debug)]
+struct PageTable {
+    entries: [PageTableEntry; NUM_PAGE_TABLE_ENTRIES],
+}
+
+impl PageTable {
+    fn new() -> Self {
+        PageTable {
+            entries: [PageTableEntry {
+                physical_address: 0,
+                valid: false,
+            }; NUM_PAGE_TABLE_ENTRIES], // Initialize to invalid.
+        }
+    }
+}
+/// Paged memory mapping for mapping 64-bit virtual address to 32-bit host addresses
+pub struct PagedMemoryMapping<'a> {
+    regions: Box<[MemoryRegion]>,
+    config: &'a Config,
+    sbpf_version: SBPFVersion,
+    cow_cb: Option<MemoryCowCallback>,
+    page_table: PageTable, // Add the page table here
+}
+
+impl<'a> PagedMemoryMapping<'a> {
+    //Modify this function to handle the 32 bit case.
+    fn new(
+        regions: Vec<MemoryRegion>,
+        config: &'a Config,
+        sbpf_version: SBPFVersion,
+    ) -> Result<Self, EbpfError> {
+        let mut paged_memory_mapping = PagedMemoryMapping {
+            regions: regions.into_boxed_slice(),
+            config,
+            sbpf_version,
+            cow_cb: None,
+            page_table: PageTable::new(),
+        };
+
+        paged_memory_mapping.initialize_page_table()?;
+
+        Ok(paged_memory_mapping)
+    }
+
+    #[allow(clippy::arithmetic_side_effects)]
+    fn initialize_page_table(&mut self) -> Result<(), EbpfError> {
+        for region in &self.regions {
+            let vm_start = region.vm_addr;
+            let vm_end = region.vm_addr_end;
+            // let len = region.len;
+
+            //Get the starting physical address. This operation may depend on your setup.
+            let host_addr = region.host_addr.get() as u32;
+
+            // Calculate the starting and ending page indices
+            let start_page_index: usize = (vm_start as usize) / PAGE_SIZE;
+            let end_page_index: usize = (vm_end as usize) / PAGE_SIZE;
+
+            let host_addr_offset: usize = (vm_start as usize) % PAGE_SIZE;
+
+            // Populate the Page Table, assuming linear mapping and pre-allocated physical memory.
+            for page_index in start_page_index..end_page_index + 1 {
+                if page_index >= NUM_PAGE_TABLE_ENTRIES {
+                    return Err(EbpfError::InvalidMemoryRegion(page_index));
+                }
+
+                let physical_address =
+                    host_addr + ((page_index * PAGE_SIZE) - host_addr_offset) as u32;
+                self.page_table.entries[page_index] = PageTableEntry {
+                    physical_address,
+                    valid: true,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    // Translates a virtual address to a physical address using the page table.
+    fn translate_virtual_to_physical(&self, vm_addr: u64) -> StableResult<u32, EbpfError> {
+        let page_index: usize = (vm_addr as usize) / PAGE_SIZE;
+        let offset_within_page: usize = (vm_addr as usize) % PAGE_SIZE;
+
+        if page_index >= NUM_PAGE_TABLE_ENTRIES {
+            return Err(EbpfError::InvalidVirtualAddress(vm_addr)).into();
+        }
+
+        let page_table_entry = self.page_table.entries[page_index];
+
+        if !page_table_entry.valid {
+            return Err(EbpfError::AccessNotMapped).into();
+        }
+
+        //Add the offset to get final physical address
+        let physical_address = page_table_entry
+            .physical_address
+            .wrapping_add(offset_within_page as u32);
+
+        Ok(physical_address).into()
+    }
+
+    /// Given a list of regions translate from virtual machine to host address
+    pub fn map(&self, access_type: AccessType, vm_addr: u64, len: u64) -> ProgramResult {
+        let physical_address = self.translate_virtual_to_physical(vm_addr).map_err(|_| {
+            generate_access_violation(self.config, self.sbpf_version, access_type, vm_addr, len)
+                .unwrap_err()
+        });
+
+        match physical_address.into() {
+            Ok(physical_address) => ProgramResult::Ok(physical_address as u64),
+            Err(err) => Err(err).into(),
+        }
+    }
+
+    /// Loads `size_of::<T>()` bytes from the given address.
+    ///
+    /// See [MemoryMapping::load].
+    #[inline]
+    pub fn load<T: Pod + Into<u64>>(&self, vm_addr: u64) -> ProgramResult {
+        let len = mem::size_of::<T>() as u64;
+        match self.map(AccessType::Load, vm_addr, len) {
+            ProgramResult::Ok(physical_address) => ProgramResult::Ok(
+                unsafe { ptr::read_unaligned::<T>(physical_address as *const _) }.into(),
+            ),
+            err => err,
+        }
+    }
+
+    /// Store `value` at the given address.
+    ///
+    /// See [MemoryMapping::store].
+    #[inline]
+    pub fn store<T: Pod>(&self, value: T, vm_addr: u64) -> ProgramResult {
+        let len = mem::size_of::<T>() as u64;
+        debug_assert!(len <= mem::size_of::<u64>() as u64);
+
+        match self.map(AccessType::Store, vm_addr, len) {
+            ProgramResult::Ok(physical_address) => {
+                // Safety:
+                // map succeeded so we can write at least `len` bytes
+                unsafe {
+                    ptr::write_unaligned(physical_address as *mut T, value);
+                }
+                ProgramResult::Ok(0)
+            }
+
+            err => err,
+        }
+    }
+
+    /// Returns the `MemoryRegion`s in this mapping
+    pub fn get_regions(&self) -> &[MemoryRegion] {
+        &self.regions
+    }
+
+    /// Returns the `MemoryRegion` corresponding to the given address.
+    pub fn region(
+        &self,
+        access_type: AccessType,
+        vm_addr: u64,
+    ) -> Result<&MemoryRegion, EbpfError> {
+        for region in &*self.regions {
+            if (region.vm_addr..region.vm_addr_end).contains(&vm_addr)
+                && (access_type == AccessType::Load || ensure_writable_region(region, &self.cow_cb))
+            {
+                return Ok(region);
+            }
+        }
+        Err(
+            generate_access_violation(self.config, self.sbpf_version, access_type, vm_addr, 0)
+                .unwrap_err(),
+        )
+    }
+
+    /// Replaces the `MemoryRegion` at the given index
+    pub fn replace_region(&mut self, index: usize, region: MemoryRegion) -> Result<(), EbpfError> {
+        if index >= self.regions.len() {
+            return Err(EbpfError::InvalidMemoryRegion(index));
+        }
+
+        //Check to ensure regions are equal.
+        if region.vm_addr != self.regions[index].vm_addr {
+            return Err(EbpfError::InvalidMemoryRegion(index));
+        }
+
+        self.regions[index] = region;
+
+        //Reinitialize the page table again.
+        self.initialize_page_table()?;
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PagedMemoryMapping<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PagedMemoryMapping")
+            .field("regions", &self.regions)
+            .field("config", &self.config)
+            .field(
+                "cow_cb",
+                &self
+                    .cow_cb
+                    .as_ref()
+                    .map(|cb| format!("Some({:p})", &cb))
+                    .unwrap_or_else(|| "None".to_string()),
+            )
+            .field("page_table", &self.page_table)
+            .finish()
+    }
+}
+
 /// Maps virtual memory to host memory.
 #[derive(Debug)]
 pub enum MemoryMapping<'a> {
@@ -736,6 +963,8 @@ pub enum MemoryMapping<'a> {
     Aligned(AlignedMemoryMapping<'a>),
     /// Memory mapping that allows mapping unaligned memory regions.
     Unaligned(UnalignedMemoryMapping<'a>),
+    /// Paged memory mapping which uses page tables
+    Paged(Box<PagedMemoryMapping<'a>>),
 }
 
 impl<'a> MemoryMapping<'a> {
@@ -752,11 +981,27 @@ impl<'a> MemoryMapping<'a> {
         config: &'a Config,
         sbpf_version: SBPFVersion,
     ) -> Result<Self, EbpfError> {
-        if config.aligned_memory_mapping {
+        if config.paged_memory_mapping {
+            MemoryMapping::new_paged(regions, config, sbpf_version)
+        } else if config.aligned_memory_mapping {
             AlignedMemoryMapping::new(regions, config, sbpf_version).map(MemoryMapping::Aligned)
         } else {
             UnalignedMemoryMapping::new(regions, config, sbpf_version).map(MemoryMapping::Unaligned)
         }
+    }
+
+    /// Creates a new memory mapping with paged tables.
+    ///
+    fn new_paged(
+        regions: Vec<MemoryRegion>,
+        config: &'a Config,
+        sbpf_version: SBPFVersion,
+    ) -> Result<Self, EbpfError> {
+        Ok(MemoryMapping::Paged(Box::new(PagedMemoryMapping::new(
+            regions,
+            config,
+            sbpf_version,
+        )?)))
     }
 
     /// Creates a new memory mapping.
@@ -784,6 +1029,7 @@ impl<'a> MemoryMapping<'a> {
             MemoryMapping::Identity => ProgramResult::Ok(vm_addr),
             MemoryMapping::Aligned(m) => m.map(access_type, vm_addr, len),
             MemoryMapping::Unaligned(m) => m.map(access_type, vm_addr, len),
+            MemoryMapping::Paged(m) => m.map(access_type, vm_addr, len),
         }
     }
 
@@ -798,6 +1044,7 @@ impl<'a> MemoryMapping<'a> {
             },
             MemoryMapping::Aligned(m) => m.load::<T>(vm_addr),
             MemoryMapping::Unaligned(m) => m.load::<T>(vm_addr),
+            MemoryMapping::Paged(m) => m.load::<T>(vm_addr),
         }
     }
 
@@ -813,6 +1060,7 @@ impl<'a> MemoryMapping<'a> {
             },
             MemoryMapping::Aligned(m) => m.store(value, vm_addr),
             MemoryMapping::Unaligned(m) => m.store(value, vm_addr),
+            MemoryMapping::Paged(m) => m.store(value, vm_addr),
         }
     }
 
@@ -826,6 +1074,7 @@ impl<'a> MemoryMapping<'a> {
             MemoryMapping::Identity => Err(EbpfError::InvalidMemoryRegion(0)),
             MemoryMapping::Aligned(m) => m.region(access_type, vm_addr),
             MemoryMapping::Unaligned(m) => m.region(access_type, vm_addr),
+            MemoryMapping::Paged(m) => m.region(access_type, vm_addr),
         }
     }
 
@@ -835,6 +1084,7 @@ impl<'a> MemoryMapping<'a> {
             MemoryMapping::Identity => &[],
             MemoryMapping::Aligned(m) => m.get_regions(),
             MemoryMapping::Unaligned(m) => m.get_regions(),
+            MemoryMapping::Paged(m) => m.get_regions(),
         }
     }
 
@@ -844,6 +1094,7 @@ impl<'a> MemoryMapping<'a> {
             MemoryMapping::Identity => Err(EbpfError::InvalidMemoryRegion(index)),
             MemoryMapping::Aligned(m) => m.replace_region(index, region),
             MemoryMapping::Unaligned(m) => m.replace_region(index, region),
+            MemoryMapping::Paged(m) => m.replace_region(index, region),
         }
     }
 }

@@ -75,6 +75,9 @@ pub enum EbpfError {
     /// Syscall error
     #[error("Syscall error: {0}")]
     SyscallError(Box<dyn Error>),
+    /// Access violation
+    #[error("Access not mapped")]
+    AccessNotMapped
 }
 
 /// Same as `Result` but provides a stable memory layout

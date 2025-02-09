@@ -17,7 +17,7 @@ use crate::{
     elf::Executable,
     error::{EbpfError, ProgramResult},
     program::BuiltinFunction,
-    vm::{Config, ContextObject, EbpfVm},
+    vm::{Config, ContextObject, EbpfVm, Register},
 };
 
 /// Virtual memory operation helper.
@@ -94,7 +94,7 @@ pub struct Interpreter<'a, 'b, C: ContextObject> {
     pub(crate) program_vm_addr: u64,
 
     /// General purpose registers and pc
-    pub reg: [u64; 12],
+    pub reg: [Register; 12],
 
     #[cfg(feature = "debugger")]
     pub(crate) debug_state: DebugState,
@@ -107,7 +107,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
     pub fn new(
         vm: &'a mut EbpfVm<'b, C>,
         executable: &'a Executable<C>,
-        registers: [u64; 12],
+        registers: [Register; 12],
     ) -> Self {
         let (program_vm_addr, program) = executable.get_text_bytes();
         Self {
@@ -135,7 +135,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             &self.reg[ebpf::FIRST_SCRATCH_REG..ebpf::FIRST_SCRATCH_REG + ebpf::SCRATCH_REGS],
         );
         frame.frame_pointer = self.reg[ebpf::FRAME_PTR_REG];
-        frame.target_pc = self.reg[11] + 1;
+        frame.target_pc = Register::from_u64(self.reg[11].to_u64() + 1);
 
         self.vm.call_depth += 1;
         if self.vm.call_depth as usize == config.max_call_depth {
@@ -148,7 +148,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                 config.stack_frame_size * if config.enable_stack_frame_gaps { 2 } else { 1 };
             self.vm.stack_pointer += stack_frame_size as u64;
         }
-        self.reg[ebpf::FRAME_PTR_REG] = self.vm.stack_pointer;
+        self.reg[ebpf::FRAME_PTR_REG] = Register::from_u64(self.vm.stack_pointer);
 
         true
     }
@@ -176,16 +176,16 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             throw_error!(self, EbpfError::ExceededMaxInstructions);
         }
         self.vm.due_insn_count += 1;
-        if self.reg[11] as usize * ebpf::INSN_SIZE >= self.program.len() {
+        if self.reg[11].to_u64() as usize * ebpf::INSN_SIZE >= self.program.len() {
             throw_error!(self, EbpfError::ExecutionOverrun);
         }
-        let mut next_pc = self.reg[11] + 1;
-        let mut insn = ebpf::get_insn_unchecked(self.program, self.reg[11] as usize);
+        let mut next_pc = self.reg[11].to_u64() + 1;
+        let mut insn = ebpf::get_insn_unchecked(self.program, self.reg[11].to_u64() as usize);
         let dst = insn.dst as usize;
         let src = insn.src as usize;
 
         if config.enable_instruction_tracing {
-            self.vm.context_object_pointer.trace(self.reg);
+            self.vm.context_object_pointer.trace(self.reg.map(Register::into_u64));
         }
 
         match insn.opc {
@@ -201,126 +201,126 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
 
             ebpf::LD_DW_IMM if self.executable.get_sbpf_version().enable_lddw() => {
                 ebpf::augment_lddw_unchecked(self.program, &mut insn);
-                self.reg[dst] = insn.imm as u64;
-                self.reg[11] += 1;
+                self.reg[dst] = Register::from_u64(insn.imm as u64);
+                self.reg[11] = Register::from_u64(self.reg[11].to_u64() + 1);
                 next_pc += 1;
             },
 
             // BPF_LDX class
             ebpf::LD_B_REG  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u8);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u8));
             },
             ebpf::LD_H_REG  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u16);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u16));
             },
             ebpf::LD_W_REG  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u32);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u32));
             },
             ebpf::LD_DW_REG if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u64);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u64));
             },
 
             // BPF_ST class
             ebpf::ST_B_IMM  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u8);
             },
             ebpf::ST_H_IMM  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u16);
             },
             ebpf::ST_W_IMM  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u32);
             },
             ebpf::ST_DW_IMM if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u64);
             },
 
             // BPF_STX class
             ebpf::ST_B_REG  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u8);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u8);
             },
             ebpf::ST_H_REG  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u16);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u16);
             },
             ebpf::ST_W_REG  if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u32);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u32);
             },
             ebpf::ST_DW_REG if !self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u64);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u64);
             },
 
             // BPF_ALU32_LOAD class
-            ebpf::ADD32_IMM  => self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_add(insn.imm as i32)),
-            ebpf::ADD32_REG  => self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_add(self.reg[src] as i32)),
+            ebpf::ADD32_IMM  => self.reg[dst] = Register::from_u64(self.sign_extension((self.reg[dst].to_u64() as i32).wrapping_add(insn.imm as i32))),
+            ebpf::ADD32_REG  => self.reg[dst] = Register::from_u64(self.sign_extension((self.reg[dst].to_u64() as i32).wrapping_add(self.reg[src].to_u64() as i32))),
             ebpf::SUB32_IMM  => if self.executable.get_sbpf_version().swap_sub_reg_imm_operands() {
-                                self.reg[dst] = self.sign_extension((insn.imm as i32).wrapping_sub(self.reg[dst] as i32))
+                                self.reg[dst] = Register::from_u64(self.sign_extension((insn.imm as i32).wrapping_sub(self.reg[dst].to_u64() as i32)))
             } else {
-                                self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_sub(insn.imm as i32))
+                                self.reg[dst] = Register::from_u64(self.sign_extension((self.reg[dst].to_u64() as i32).wrapping_sub(insn.imm as i32)))
             },
-            ebpf::SUB32_REG  => self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_sub(self.reg[src] as i32)),
-            ebpf::MUL32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as i32).wrapping_mul(insn.imm as i32)      as u64,
-            ebpf::MUL32_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as i32).wrapping_mul(self.reg[src] as i32) as u64,
+            ebpf::SUB32_REG  => self.reg[dst] = Register::from_u64(self.sign_extension((self.reg[dst].to_u64() as i32).wrapping_sub(self.reg[src].to_u64() as i32))),
+            ebpf::MUL32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32).wrapping_mul(insn.imm as i32) as u64),
+            ebpf::MUL32_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32).wrapping_mul(self.reg[src].to_u64() as i32) as u64),
             ebpf::LD_1B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u8);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u8));
             },
-            ebpf::DIV32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u32             / insn.imm as u32)      as u64,
+            ebpf::DIV32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32  /     insn.imm as u32)     as u64),
             ebpf::DIV32_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u32);
-                                self.reg[dst] = (self.reg[dst] as u32             / self.reg[src] as u32) as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             / self.reg[src].to_u64() as u32) as u64);
             },
             ebpf::LD_2B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u16);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u16));
             },
-            ebpf::OR32_IMM   => self.reg[dst] = (self.reg[dst] as u32             | insn.imm as u32)      as u64,
-            ebpf::OR32_REG   => self.reg[dst] = (self.reg[dst] as u32             | self.reg[src] as u32) as u64,
-            ebpf::AND32_IMM  => self.reg[dst] = (self.reg[dst] as u32             & insn.imm as u32)      as u64,
-            ebpf::AND32_REG  => self.reg[dst] = (self.reg[dst] as u32             & self.reg[src] as u32) as u64,
-            ebpf::LSH32_IMM  => self.reg[dst] = (self.reg[dst] as u32).wrapping_shl(insn.imm as u32)      as u64,
-            ebpf::LSH32_REG  => self.reg[dst] = (self.reg[dst] as u32).wrapping_shl(self.reg[src] as u32) as u64,
-            ebpf::RSH32_IMM  => self.reg[dst] = (self.reg[dst] as u32).wrapping_shr(insn.imm as u32)      as u64,
-            ebpf::RSH32_REG  => self.reg[dst] = (self.reg[dst] as u32).wrapping_shr(self.reg[src] as u32) as u64,
-            ebpf::NEG32      if self.executable.get_sbpf_version().enable_neg() => self.reg[dst] = (self.reg[dst] as i32).wrapping_neg()                     as u64 & (u32::MAX as u64),
+            ebpf::OR32_IMM   => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             | insn.imm as u32)      as u64),
+            ebpf::OR32_REG   => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             | self.reg[src].to_u64() as u32) as u64),
+            ebpf::AND32_IMM  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             & insn.imm as u32)      as u64),
+            ebpf::AND32_REG  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             & self.reg[src].to_u64() as u32) as u64),
+            ebpf::LSH32_IMM  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32).wrapping_shl(insn.imm as u32)      as u64),
+            ebpf::LSH32_REG  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32).wrapping_shl(self.reg[src].to_u64() as u32) as u64),
+            ebpf::RSH32_IMM  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32).wrapping_shr(insn.imm as u32)      as u64),
+            ebpf::RSH32_REG  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32).wrapping_shr(self.reg[src].to_u64() as u32) as u64),
+            ebpf::NEG32      if self.executable.get_sbpf_version().enable_neg() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32).wrapping_neg()                     as u64 & (u32::MAX as u64)),
             ebpf::LD_4B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u32);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u32));
             },
-            ebpf::MOD32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u32             % insn.imm as u32)      as u64,
+            ebpf::MOD32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             % insn.imm as u32)      as u64),
             ebpf::MOD32_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u32);
-                                self.reg[dst] = (self.reg[dst] as u32             % self.reg[src] as u32) as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             % self.reg[src].to_u64() as u32) as u64);
             },
             ebpf::LD_8B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
-                self.reg[dst] = translate_memory_access!(self, load, vm_addr, u64);
+                let vm_addr = (self.reg[src].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                self.reg[dst] = Register::from_u64(translate_memory_access!(self, load, vm_addr, u64));
             },
-            ebpf::XOR32_IMM  => self.reg[dst] = (self.reg[dst] as u32             ^ insn.imm as u32)      as u64,
-            ebpf::XOR32_REG  => self.reg[dst] = (self.reg[dst] as u32             ^ self.reg[src] as u32) as u64,
-            ebpf::MOV32_IMM  => self.reg[dst] = insn.imm as u32 as u64,
+            ebpf::XOR32_IMM  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             ^ insn.imm as u32)      as u64),
+            ebpf::XOR32_REG  => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32             ^ self.reg[src].to_u64() as u32) as u64),
+            ebpf::MOV32_IMM  => self.reg[dst] = Register::from_u64(insn.imm as u32 as u64),
             ebpf::MOV32_REG  => self.reg[dst] = if self.executable.get_sbpf_version().implicit_sign_extension_of_results() {
-                self.reg[src] as u32 as u64
+                Register::from_u64(self.reg[src].to_u64() as u32 as u64)
             } else {
-                self.reg[src] as i32 as i64 as u64
+                Register::from_u64(self.reg[src].to_u64() as i32 as i64 as u64)
             },
-            ebpf::ARSH32_IMM => self.reg[dst] = (self.reg[dst] as i32).wrapping_shr(insn.imm as u32)      as u32 as u64,
-            ebpf::ARSH32_REG => self.reg[dst] = (self.reg[dst] as i32).wrapping_shr(self.reg[src] as u32) as u32 as u64,
+            ebpf::ARSH32_IMM => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32).wrapping_shr(insn.imm as u32)      as u32 as u64),
+            ebpf::ARSH32_REG => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32).wrapping_shr(self.reg[src].to_u64() as u32) as u32 as u64),
             ebpf::LE if self.executable.get_sbpf_version().enable_le() => {
                 self.reg[dst] = match insn.imm {
-                    16 => (self.reg[dst] as u16).to_le() as u64,
-                    32 => (self.reg[dst] as u32).to_le() as u64,
-                    64 =>  self.reg[dst].to_le(),
+                    16 => Register::from_u64((self.reg[dst].to_u64() as u16).to_le() as u64),
+                    32 => Register::from_u64((self.reg[dst].to_u64() as u32).to_le() as u64),
+                    64 =>  Register::from_u64(self.reg[dst].to_u64().to_le()),
                     _  => {
                         throw_error!(self, EbpfError::InvalidInstruction);
                     }
@@ -328,9 +328,9 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             },
             ebpf::BE         => {
                 self.reg[dst] = match insn.imm {
-                    16 => (self.reg[dst] as u16).to_be() as u64,
-                    32 => (self.reg[dst] as u32).to_be() as u64,
-                    64 =>  self.reg[dst].to_be(),
+                    16 => Register::from_u64((self.reg[dst].to_u64() as u16).to_be() as u64),
+                    32 => Register::from_u64((self.reg[dst].to_u64() as u32).to_be() as u64),
+                    64 =>  Register::from_u64(self.reg[dst].to_u64().to_be()),
                     _  => {
                         throw_error!(self, EbpfError::InvalidInstruction);
                     }
@@ -338,175 +338,175 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             },
 
             // BPF_ALU64_STORE class
-            ebpf::ADD64_IMM  => self.reg[dst] =  self.reg[dst].wrapping_add(insn.imm as u64),
-            ebpf::ADD64_REG  => self.reg[dst] =  self.reg[dst].wrapping_add(self.reg[src]),
+            ebpf::ADD64_IMM  => self.reg[dst] =  Register::from_u64(self.reg[dst].to_u64().wrapping_add(insn.imm as u64)),
+            ebpf::ADD64_REG  => self.reg[dst] =  Register::from_u64(self.reg[dst].to_u64().wrapping_add(self.reg[src].to_u64())),
             ebpf::SUB64_IMM  => if self.executable.get_sbpf_version().swap_sub_reg_imm_operands() {
-                                self.reg[dst] =  (insn.imm as u64).wrapping_sub(self.reg[dst])
+                                self.reg[dst] =  Register::from_u64((insn.imm as u64).wrapping_sub(self.reg[dst].to_u64()))
             } else {
-                                self.reg[dst] =  self.reg[dst].wrapping_sub(insn.imm as u64)
+                                self.reg[dst] =  Register::from_u64(self.reg[dst].to_u64().wrapping_sub(insn.imm as u64))
             },
-            ebpf::SUB64_REG  => self.reg[dst] =  self.reg[dst].wrapping_sub(self.reg[src]),
-            ebpf::MUL64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] =  self.reg[dst].wrapping_mul(insn.imm as u64),
+            ebpf::SUB64_REG  => self.reg[dst] =  Register::from_u64(self.reg[dst].to_u64().wrapping_sub(self.reg[src].to_u64())),
+            ebpf::MUL64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] =  Register::from_u64(self.reg[dst].to_u64().wrapping_mul(insn.imm as u64)),
             ebpf::ST_1B_IMM  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u8);
             },
-            ebpf::MUL64_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] =  self.reg[dst].wrapping_mul(self.reg[src]),
+            ebpf::MUL64_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] =  Register::from_u64(self.reg[dst].to_u64().wrapping_mul(self.reg[src].to_u64())),
             ebpf::ST_1B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u8);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u8);
             },
-            ebpf::DIV64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] /= insn.imm as u64,
+            ebpf::DIV64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() / insn.imm as u64),
             ebpf::ST_2B_IMM  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u16);
             },
             ebpf::DIV64_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u64);
-                                self.reg[dst] /= self.reg[src];
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u64);
+                                self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() / self.reg[src].to_u64());
             },
             ebpf::ST_2B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u16);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u16);
             },
-            ebpf::OR64_IMM   => self.reg[dst] |= insn.imm as u64,
-            ebpf::OR64_REG   => self.reg[dst] |= self.reg[src],
-            ebpf::AND64_IMM  => self.reg[dst] &= insn.imm as u64,
-            ebpf::AND64_REG  => self.reg[dst] &= self.reg[src],
-            ebpf::LSH64_IMM  => self.reg[dst] =  self.reg[dst].wrapping_shl(insn.imm as u32),
-            ebpf::LSH64_REG  => self.reg[dst] =  self.reg[dst].wrapping_shl(self.reg[src] as u32),
-            ebpf::RSH64_IMM  => self.reg[dst] =  self.reg[dst].wrapping_shr(insn.imm as u32),
-            ebpf::RSH64_REG  => self.reg[dst] =  self.reg[dst].wrapping_shr(self.reg[src] as u32),
+            ebpf::OR64_IMM   => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() | insn.imm as u64),
+            ebpf::OR64_REG   => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() | self.reg[src].to_u64()),
+            ebpf::AND64_IMM  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() & insn.imm as u64),
+            ebpf::AND64_REG  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() & self.reg[src].to_u64()),
+            ebpf::LSH64_IMM  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64().wrapping_shl(insn.imm as u32)),
+            ebpf::LSH64_REG  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64().wrapping_shl(self.reg[src].to_u64() as u32)),
+            ebpf::RSH64_IMM  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64().wrapping_shr(insn.imm as u32)),
+            ebpf::RSH64_REG  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64().wrapping_shr(self.reg[src].to_u64() as u32)),
             ebpf::ST_4B_IMM  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u32);
             },
-            ebpf::NEG64      if self.executable.get_sbpf_version().enable_neg() => self.reg[dst] = (self.reg[dst] as i64).wrapping_neg() as u64,
+            ebpf::NEG64      if self.executable.get_sbpf_version().enable_neg() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64).wrapping_neg() as u64),
             ebpf::ST_4B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u32);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u32);
             },
-            ebpf::MOD64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] %= insn.imm as u64,
+            ebpf::MOD64_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] =  Register::from_u64(self.reg[dst].to_u64() % insn.imm as u64),
             ebpf::ST_8B_IMM  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
                 translate_memory_access!(self, store, insn.imm, vm_addr, u64);
             },
             ebpf::MOD64_REG  if !self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u64);
-                                self.reg[dst] %= self.reg[src];
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u64);
+                                self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() % self.reg[src].to_u64());
             },
             ebpf::ST_8B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
-                let vm_addr = (self.reg[dst] as i64).wrapping_add(insn.off as i64) as u64;
-                translate_memory_access!(self, store, self.reg[src], vm_addr, u64);
+                let vm_addr = (self.reg[dst].to_u64() as i64).wrapping_add(insn.off as i64) as u64;
+                translate_memory_access!(self, store, self.reg[src].to_u64(), vm_addr, u64);
             },
-            ebpf::XOR64_IMM  => self.reg[dst] ^= insn.imm as u64,
-            ebpf::XOR64_REG  => self.reg[dst] ^= self.reg[src],
-            ebpf::MOV64_IMM  => self.reg[dst] =  insn.imm as u64,
+            ebpf::XOR64_IMM  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() ^ insn.imm as u64),
+            ebpf::XOR64_REG  => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() ^ self.reg[src].to_u64()),
+            ebpf::MOV64_IMM  => self.reg[dst] =  Register::from_u64(insn.imm as u64),
             ebpf::MOV64_REG  => self.reg[dst] =  self.reg[src],
-            ebpf::ARSH64_IMM => self.reg[dst] = (self.reg[dst] as i64).wrapping_shr(insn.imm as u32)      as u64,
-            ebpf::ARSH64_REG => self.reg[dst] = (self.reg[dst] as i64).wrapping_shr(self.reg[src] as u32) as u64,
+            ebpf::ARSH64_IMM => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64).wrapping_shr(insn.imm as u32)      as u64),
+            ebpf::ARSH64_REG => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64).wrapping_shr(self.reg[src].to_u64() as u32) as u64),
             ebpf::HOR64_IMM if !self.executable.get_sbpf_version().enable_lddw() => {
-                self.reg[dst] |= (insn.imm as u64).wrapping_shl(32);
+                self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() | (insn.imm as u64).wrapping_shl(32));
             }
 
             // BPF_PQR class
-            ebpf::LMUL32_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u32).wrapping_mul(insn.imm as u32) as u64,
-            ebpf::LMUL32_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u32).wrapping_mul(self.reg[src] as u32) as u64,
-            ebpf::LMUL64_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = self.reg[dst].wrapping_mul(insn.imm as u64),
-            ebpf::LMUL64_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = self.reg[dst].wrapping_mul(self.reg[src]),
-            ebpf::UHMUL64_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u128).wrapping_mul(insn.imm as u64 as u128).wrapping_shr(64) as u64,
-            ebpf::UHMUL64_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as u128).wrapping_mul(self.reg[src] as u128).wrapping_shr(64) as u64,
-            ebpf::SHMUL64_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as i64 as i128).wrapping_mul(insn.imm as i128).wrapping_shr(64) as u64,
-            ebpf::SHMUL64_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as i64 as i128).wrapping_mul(self.reg[src] as i64 as i128).wrapping_shr(64) as u64,
+            ebpf::LMUL32_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32).wrapping_mul(insn.imm as u32) as u64),
+            ebpf::LMUL32_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32).wrapping_mul(self.reg[src].to_u64() as u32) as u64),
+            ebpf::LMUL64_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64().wrapping_mul(insn.imm as u64)),
+            ebpf::LMUL64_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64(self.reg[dst].to_u64().wrapping_mul(self.reg[src].to_u64())),
+            ebpf::UHMUL64_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u128).wrapping_mul(insn.imm as u64 as u128).wrapping_shr(64) as u64),
+            ebpf::UHMUL64_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u128).wrapping_mul(self.reg[src].to_u64() as u128).wrapping_shr(64) as u64),
+            ebpf::SHMUL64_IMM if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64 as i128).wrapping_mul(insn.imm as i128).wrapping_shr(64) as u64),
+            ebpf::SHMUL64_REG if self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64 as i128).wrapping_mul(self.reg[src].to_u64() as i64 as i128).wrapping_shr(64) as u64),
             ebpf::UDIV32_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                                self.reg[dst] = (self.reg[dst] as u32 / insn.imm as u32)      as u64;
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32 / insn.imm as u32)      as u64);
             }
             ebpf::UDIV32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u32);
-                                self.reg[dst] = (self.reg[dst] as u32 / self.reg[src] as u32) as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32 / self.reg[src].to_u64() as u32) as u64);
             },
             ebpf::UDIV64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                                self.reg[dst] /= insn.imm as u64;
+                                self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() / insn.imm as u64);
             }
             ebpf::UDIV64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u64);
-                                self.reg[dst] /= self.reg[src];
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u64);
+                                self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() / self.reg[src].to_u64());
             },
             ebpf::UREM32_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                                self.reg[dst] = (self.reg[dst] as u32 % insn.imm as u32)      as u64;
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32 % insn.imm as u32)      as u64);
             }
             ebpf::UREM32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u32);
-                                self.reg[dst] = (self.reg[dst] as u32 % self.reg[src] as u32) as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as u32 % self.reg[src].to_u64() as u32) as u64);
             },
             ebpf::UREM64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                                self.reg[dst] %= insn.imm as u64;
+                                self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() % insn.imm as u64);
             }
             ebpf::UREM64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], u64);
-                                self.reg[dst] %= self.reg[src];
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), u64);
+                                self.reg[dst] = Register::from_u64(self.reg[dst].to_u64() % self.reg[src].to_u64());
             },
             ebpf::SDIV32_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i32);
-                                self.reg[dst] = (self.reg[dst] as i32 / insn.imm as i32)      as u32 as u64;
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst].to_u64(), i32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32 / insn.imm as i32)      as u32 as u64);
             }
             ebpf::SDIV32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], i32);
-                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i32);
-                                self.reg[dst] = (self.reg[dst] as i32 / self.reg[src] as i32) as u32 as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), i32);
+                throw_error!(DivideOverflow; self, self.reg[src].to_u64(), self.reg[dst].to_u64(), i32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32 / self.reg[src].to_u64() as i32) as u32 as u64);
             },
             ebpf::SDIV64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i64);
-                                self.reg[dst] = (self.reg[dst] as i64 / insn.imm)             as u64;
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst].to_u64(), i64);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64 / insn.imm)             as u64);
             }
             ebpf::SDIV64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], i64);
-                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i64);
-                                self.reg[dst] = (self.reg[dst] as i64 / self.reg[src] as i64) as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), i64);
+                throw_error!(DivideOverflow; self, self.reg[src].to_u64(), self.reg[dst].to_u64(), i64);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64 / self.reg[src].to_u64() as i64) as u64);
             },
             ebpf::SREM32_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i32);
-                                self.reg[dst] = (self.reg[dst] as i32 % insn.imm as i32)      as u32 as u64;
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst].to_u64(), i32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32 % insn.imm as i32)      as u32 as u64);
             }
             ebpf::SREM32_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], i32);
-                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i32);
-                                self.reg[dst] = (self.reg[dst] as i32 % self.reg[src] as i32) as u32 as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), i32);
+                throw_error!(DivideOverflow; self, self.reg[src].to_u64(), self.reg[dst].to_u64(), i32);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i32 % self.reg[src].to_u64() as i32) as u32 as u64);
             },
             ebpf::SREM64_IMM if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst], i64);
-                                self.reg[dst] = (self.reg[dst] as i64 % insn.imm)             as u64;
+                throw_error!(DivideOverflow; self, insn.imm, self.reg[dst].to_u64(), i64);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64 % insn.imm)             as u64);
             }
             ebpf::SREM64_REG if self.executable.get_sbpf_version().enable_pqr() => {
-                throw_error!(DivideByZero; self, self.reg[src], i64);
-                throw_error!(DivideOverflow; self, self.reg[src], self.reg[dst], i64);
-                                self.reg[dst] = (self.reg[dst] as i64 % self.reg[src] as i64) as u64;
+                throw_error!(DivideByZero; self, self.reg[src].to_u64(), i64);
+                throw_error!(DivideOverflow; self, self.reg[src].to_u64(), self.reg[dst].to_u64(), i64);
+                                self.reg[dst] = Register::from_u64((self.reg[dst].to_u64() as i64 % self.reg[src].to_u64() as i64) as u64);
             },
 
             // BPF_JMP class
-            ebpf::JA         =>                                                   { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JEQ_IMM    => if  self.reg[dst] == insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JEQ_REG    => if  self.reg[dst] == self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGT_IMM    => if  self.reg[dst] >  insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGT_REG    => if  self.reg[dst] >  self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGE_IMM    => if  self.reg[dst] >= insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGE_REG    => if  self.reg[dst] >= self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLT_IMM    => if  self.reg[dst] <  insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLT_REG    => if  self.reg[dst] <  self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLE_IMM    => if  self.reg[dst] <= insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLE_REG    => if  self.reg[dst] <= self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSET_IMM   => if  self.reg[dst] &  insn.imm as u64 != 0         { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSET_REG   => if  self.reg[dst] &  self.reg[src] != 0           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JNE_IMM    => if  self.reg[dst] != insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JNE_REG    => if  self.reg[dst] != self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGT_IMM   => if (self.reg[dst] as i64) >  insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGT_REG   => if (self.reg[dst] as i64) >  self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGE_IMM   => if (self.reg[dst] as i64) >= insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGE_REG   => if (self.reg[dst] as i64) >= self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLT_IMM   => if (self.reg[dst] as i64) <  insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLT_REG   => if (self.reg[dst] as i64) <  self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLE_IMM   => if (self.reg[dst] as i64) <= insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLE_REG   => if (self.reg[dst] as i64) <= self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JA         =>                                                                     { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JEQ_IMM    => if  self.reg[dst].to_u64() == insn.imm as u64                       { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JEQ_REG    => if  self.reg[dst].to_u64() == self.reg[src].to_u64()                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGT_IMM    => if  self.reg[dst].to_u64() >  insn.imm as u64                       { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGT_REG    => if  self.reg[dst].to_u64() >  self.reg[src].to_u64()                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGE_IMM    => if  self.reg[dst].to_u64() >= insn.imm as u64                       { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGE_REG    => if  self.reg[dst].to_u64() >= self.reg[src].to_u64()                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLT_IMM    => if  self.reg[dst].to_u64() <  insn.imm as u64                       { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLT_REG    => if  self.reg[dst].to_u64() <  self.reg[src].to_u64()                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLE_IMM    => if  self.reg[dst].to_u64() <= insn.imm as u64                       { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLE_REG    => if  self.reg[dst].to_u64() <= self.reg[src].to_u64()                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSET_IMM   => if  self.reg[dst].to_u64() &  insn.imm as u64 != 0                  { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSET_REG   => if  self.reg[dst].to_u64() &  self.reg[src].to_u64() != 0           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JNE_IMM    => if  self.reg[dst].to_u64() != insn.imm as u64                       { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JNE_REG    => if  self.reg[dst].to_u64() != self.reg[src].to_u64()                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGT_IMM   => if (self.reg[dst].to_u64() as i64) >  insn.imm                      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGT_REG   => if (self.reg[dst].to_u64() as i64) >  self.reg[src].to_u64() as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGE_IMM   => if (self.reg[dst].to_u64() as i64) >= insn.imm                      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGE_REG   => if (self.reg[dst].to_u64() as i64) >= self.reg[src].to_u64() as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLT_IMM   => if (self.reg[dst].to_u64() as i64) <  insn.imm                      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLT_REG   => if (self.reg[dst].to_u64() as i64) <  self.reg[src].to_u64() as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLE_IMM   => if (self.reg[dst].to_u64() as i64) <= insn.imm                      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLE_REG   => if (self.reg[dst].to_u64() as i64) <= self.reg[src].to_u64() as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
 
             ebpf::CALL_REG   => {
                 let target_pc = if self.executable.get_sbpf_version().callx_uses_src_reg() {
@@ -517,10 +517,10 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                 if !self.push_frame(config) {
                     return false;
                 }
-                check_pc!(self, next_pc, target_pc.wrapping_sub(self.program_vm_addr) / ebpf::INSN_SIZE as u64);
+                check_pc!(self, next_pc, target_pc.to_u64().wrapping_sub(self.program_vm_addr) / ebpf::INSN_SIZE as u64);
                 if self.executable.get_sbpf_version().static_syscalls() && self.executable.get_function_registry().lookup_by_key(next_pc as u32).is_none() {
                     self.vm.due_insn_count += 1;
-                    self.reg[11] = next_pc;
+                    self.reg[11] = Register::from_u64(next_pc);
                     throw_error!(self, EbpfError::UnsupportedInstruction);
                 }
             },
@@ -533,7 +533,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                             self.executable.get_loader().get_function_registry(self.executable.get_sbpf_version()).lookup_by_key(insn.imm as u32)) {
                     // SBPFv1 syscall
                     self.reg[0] = match self.dispatch_syscall(function) {
-                        ProgramResult::Ok(value) => *value,
+                        ProgramResult::Ok(value) => Register::from_u64(*value),
                         ProgramResult::Err(_err) => return false,
                     };
                 } else if let Some((_, target_pc)) =
@@ -543,7 +543,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                                 self
                                     .executable
                                     .get_sbpf_version()
-                                    .calculate_call_imm_target_pc(self.reg[11] as usize, insn.imm)
+                                    .calculate_call_imm_target_pc(self.reg[11].to_u64() as usize, insn.imm)
                         ) {
                     // make BPF to BPF call
                     if !self.push_frame(config) {
@@ -558,7 +558,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                 if let Some((_, function)) = self.executable.get_loader().get_function_registry(self.executable.get_sbpf_version()).lookup_by_key(insn.imm as u32) {
                     // SBPFv2 syscall
                     self.reg[0] = match self.dispatch_syscall(function) {
-                        ProgramResult::Ok(value) => *value,
+                        ProgramResult::Ok(value) => Register::from_u64(*value),
                         ProgramResult::Err(_err) => return false,
                     };
                 } else {
@@ -576,7 +576,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     if config.enable_instruction_meter && self.vm.due_insn_count > self.vm.previous_instruction_meter {
                         throw_error!(self, EbpfError::ExceededMaxInstructions);
                     }
-                    self.vm.program_result = ProgramResult::Ok(self.reg[0]);
+                    self.vm.program_result = ProgramResult::Ok(self.reg[0].to_u64());
                     return false;
                 }
                 // Return from BPF to BPF call
@@ -591,12 +591,12 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                         config.stack_frame_size * if config.enable_stack_frame_gaps { 2 } else { 1 };
                     self.vm.stack_pointer -= stack_frame_size as u64;
                 }
-                check_pc!(self, next_pc, frame.target_pc);
+                check_pc!(self, next_pc, frame.target_pc.to_u64());
             }
             _ => throw_error!(self, EbpfError::UnsupportedInstruction),
         }
 
-        self.reg[11] = next_pc;
+        self.reg[11] = Register::from_u64(next_pc);
         true
     }
 
