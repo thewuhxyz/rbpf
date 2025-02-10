@@ -19,7 +19,7 @@ use crate::{
     interpreter::Interpreter,
     memory_region::MemoryMapping,
     program::{BuiltinFunction, BuiltinProgram, FunctionRegistry, SBPFVersion},
-    static_analysis::{Analysis, TraceLogEntry},
+    static_analysis::Analysis,
 };
 use std::{collections::BTreeMap, fmt::Debug};
 
@@ -137,51 +137,6 @@ pub trait ContextObject {
     fn get_remaining(&self) -> u64;
 }
 
-/// Simple instruction meter for testing
-#[derive(Debug, Clone, Default)]
-pub struct TestContextObject {
-    /// Contains the register state at every instruction in order of execution
-    pub trace_log: Vec<TraceLogEntry>,
-    /// Maximal amount of instructions which still can be executed
-    pub remaining: u64,
-}
-
-impl ContextObject for TestContextObject {
-    fn trace(&mut self, state: [u64; 12]) {
-        self.trace_log.push(state);
-    }
-
-    fn consume(&mut self, amount: u64) {
-        self.remaining = self.remaining.saturating_sub(amount);
-    }
-
-    fn get_remaining(&self) -> u64 {
-        self.remaining
-    }
-}
-
-impl TestContextObject {
-    /// Initialize with instruction meter
-    pub fn new(remaining: u64) -> Self {
-        Self {
-            trace_log: Vec::new(),
-            remaining,
-        }
-    }
-
-    /// Compares an interpreter trace and a JIT trace.
-    ///
-    /// The log of the JIT can be longer because it only validates the instruction meter at branches.
-    pub fn compare_trace_log(interpreter: &Self, jit: &Self) -> bool {
-        let interpreter = interpreter.trace_log.as_slice();
-        let mut jit = jit.trace_log.as_slice();
-        if jit.len() > interpreter.len() {
-            jit = &jit[0..interpreter.len()];
-        }
-        interpreter == jit
-    }
-}
-
 /// Statistic of taken branches (from a recorded trace)
 pub struct DynamicAnalysis {
     /// Maximal edge counter value
@@ -227,20 +182,45 @@ pub struct CallFrame {
     pub target_pc: u64,
 }
 
+/// Indices of slots inside [EbpfVm]
+pub enum RuntimeEnvironmentSlot {
+    /// [EbpfVm::host_stack_pointer]
+    HostStackPointer = 0,
+    /// [EbpfVm::call_depth]
+    CallDepth = 1,
+    /// [EbpfVm::context_object_pointer]
+    ContextObjectPointer = 2,
+    /// [EbpfVm::previous_instruction_meter]
+    PreviousInstructionMeter = 3,
+    /// [EbpfVm::due_insn_count]
+    DueInsnCount = 4,
+    /// [EbpfVm::stopwatch_numerator]
+    StopwatchNumerator = 5,
+    /// [EbpfVm::stopwatch_denominator]
+    StopwatchDenominator = 6,
+    /// [EbpfVm::registers]
+    Registers = 7,
+    /// [EbpfVm::program_result]
+    ProgramResult = 19,
+    /// [EbpfVm::memory_mapping]
+    MemoryMapping = 27,
+}
+
 /// A virtual machine to run eBPF programs.
 ///
 /// # Examples
 ///
 /// ```
-/// use solana_rbpf::{
+/// use solana_sbpf::{
 ///     aligned_memory::AlignedMemory,
 ///     ebpf,
 ///     elf::Executable,
 ///     memory_region::{MemoryMapping, MemoryRegion},
 ///     program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
 ///     verifier::RequisiteVerifier,
-///     vm::{Config, EbpfVm, TestContextObject},
+///     vm::{Config, EbpfVm},
 /// };
+/// use test_utils::TestContextObject;
 ///
 /// let prog = &[
 ///     0x9d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
@@ -364,11 +344,7 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         self.registers[1] = ebpf::MM_INPUT_START;
         self.registers[11] = executable.get_entrypoint_instruction_offset() as u64;
         let config = executable.get_config();
-        let initial_insn_count = if config.enable_instruction_meter {
-            self.context_object_pointer.get_remaining()
-        } else {
-            0
-        };
+        let initial_insn_count = self.context_object_pointer.get_remaining();
         self.previous_instruction_meter = initial_insn_count;
         self.due_insn_count = 0;
         self.program_result = ProgramResult::Ok(0);

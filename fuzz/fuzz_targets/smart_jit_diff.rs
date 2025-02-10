@@ -3,16 +3,15 @@
 use libfuzzer_sys::fuzz_target;
 
 use grammar_aware::*;
-use solana_rbpf::{
+use solana_sbpf::{
     ebpf,
     elf::Executable,
     insn_builder::{Arch, Instruction, IntoBytes},
     memory_region::MemoryRegion,
     program::{BuiltinFunction, BuiltinProgram, FunctionRegistry, SBPFVersion},
     verifier::{RequisiteVerifier, Verifier},
-    vm::TestContextObject,
 };
-use test_utils::create_vm;
+use test_utils::{create_vm, TestContextObject};
 
 use crate::common::ConfigTemplate;
 
@@ -60,7 +59,6 @@ fuzz_target!(|data: FuzzData| {
         prog.into_bytes(),
         std::sync::Arc::new(BuiltinProgram::new_loader(
             config,
-            FunctionRegistry::default(),
         )),
         SBPFVersion::V3,
         function_registry,

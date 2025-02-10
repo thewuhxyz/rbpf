@@ -15,17 +15,17 @@
 //!
 //! * Some of them mimic the syscalls available in the Linux kernel.
 //! * Some of them were proposed as example syscalls in uBPF and they were adapted here.
-//! * Other syscalls may be specific to rbpf.
+//! * Other syscalls may be specific to sbpf.
 //!
 //! The prototype for syscalls is always the same: five `u64` as arguments, and a `u64` as a return
 //! value. Hence some syscalls have unused arguments, or return a 0 value in all cases, in order to
 //! respect this convention.
 
-use crate::{
+use crate::TestContextObject;
+use solana_sbpf::{
     declare_builtin_function,
     error::EbpfError,
     memory_region::{AccessType, MemoryMapping},
-    vm::TestContextObject,
 };
 use std::{slice::from_raw_parts, str::from_utf8};
 

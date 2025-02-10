@@ -6,15 +6,13 @@
 
 #![feature(test)]
 
-extern crate solana_rbpf;
+extern crate solana_sbpf;
 extern crate test;
 
-use solana_rbpf::{
-    elf::Executable, program::BuiltinProgram, verifier::RequisiteVerifier, vm::TestContextObject,
-};
+use solana_sbpf::{elf::Executable, program::BuiltinProgram, verifier::RequisiteVerifier};
 use std::{fs::File, io::Read, sync::Arc};
 use test::Bencher;
-use test_utils::create_vm;
+use test_utils::{create_vm, TestContextObject};
 
 #[bench]
 fn bench_init_vm(bencher: &mut Bencher) {

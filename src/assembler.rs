@@ -293,7 +293,8 @@ fn resolve_label(
 /// # Examples
 ///
 /// ```
-/// use solana_rbpf::{assembler::assemble, program::BuiltinProgram, vm::{Config, TestContextObject}};
+/// use solana_sbpf::{assembler::assemble, program::BuiltinProgram, vm::Config};
+/// use test_utils::TestContextObject;
 /// let executable = assemble::<TestContextObject>(
 ///    "add64 r1, 0x605
 ///     mov64 r2, 0x32
@@ -431,7 +432,7 @@ pub fn assemble<C: ContextObject>(
                                         target_pc as usize,
                                     )
                                     .map_err(|_| format!("Label hash collision {name}"))?;
-                                insn(opc, 0, 1, 0, instr_imm)
+                                insn(opc, 0, 0, 0, instr_imm)
                             }
                             (CallReg, [Register(dst)]) => {
                                 if sbpf_version.callx_uses_src_reg() {

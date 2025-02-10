@@ -1,3 +1,5 @@
+#![allow(clippy::literal_string_with_formatting_args)]
+
 // Copyright 2017 Jan-Erik Rediger <badboy@archlinux.us>
 //
 // Adopted from tests in `tests/assembler.rs`
@@ -6,15 +8,13 @@
 // the MIT license <http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-extern crate solana_rbpf;
-use solana_rbpf::program::SBPFVersion;
-use solana_rbpf::{
-    assembler::assemble,
-    program::{BuiltinProgram, FunctionRegistry},
-    static_analysis::Analysis,
-    vm::{Config, TestContextObject},
+extern crate solana_sbpf;
+use solana_sbpf::program::SBPFVersion;
+use solana_sbpf::{
+    assembler::assemble, program::BuiltinProgram, static_analysis::Analysis, vm::Config,
 };
 use std::sync::Arc;
+use test_utils::TestContextObject;
 
 // Using a macro to keep actual line numbers in failure output
 macro_rules! disasm {
@@ -27,7 +27,7 @@ macro_rules! disasm {
     }};
     ($src:expr, $config:expr) => {{
         let src = $src;
-        let loader = BuiltinProgram::new_loader($config, FunctionRegistry::default());
+        let loader = BuiltinProgram::new_loader($config);
         let executable = assemble::<TestContextObject>(src, Arc::new(loader)).unwrap();
         let analysis = Analysis::from_executable(&executable).unwrap();
         let mut reasm = Vec::new();

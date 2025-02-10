@@ -1,25 +1,27 @@
+#![allow(clippy::literal_string_with_formatting_args)]
 #![allow(clippy::arithmetic_side_effects)]
+
 // Copyright 2017 Rich Lane <lanerl@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 <http://www.apache.org/licenses/LICENSE-2.0> or
 // the MIT license <http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-extern crate solana_rbpf;
+extern crate solana_sbpf;
 extern crate test_utils;
 
-use solana_rbpf::program::{FunctionRegistry, SBPFVersion};
-use solana_rbpf::vm::Config;
-use solana_rbpf::{assembler::assemble, ebpf, program::BuiltinProgram, vm::TestContextObject};
+use solana_sbpf::program::SBPFVersion;
+use solana_sbpf::vm::Config;
+use solana_sbpf::{assembler::assemble, ebpf, program::BuiltinProgram};
 use std::sync::Arc;
-use test_utils::{TCP_SACK_ASM, TCP_SACK_BIN};
+use test_utils::{TestContextObject, TCP_SACK_ASM, TCP_SACK_BIN};
 
 fn asm(src: &str) -> Result<Vec<ebpf::Insn>, String> {
     asm_with_config(src, Config::default())
 }
 
 fn asm_with_config(src: &str, config: Config) -> Result<Vec<ebpf::Insn>, String> {
-    let loader = BuiltinProgram::new_loader(config, FunctionRegistry::default());
+    let loader = BuiltinProgram::new_loader(config);
     let executable = assemble::<TestContextObject>(src, Arc::new(loader))?;
     let (_program_vm_addr, program) = executable.get_text_bytes();
     Ok((0..program.len() / ebpf::INSN_SIZE)
@@ -152,7 +154,7 @@ fn test_call_reg() {
 fn test_call_imm() {
     assert_eq!(
         asm("call 299"),
-        Ok(vec![insn(0, ebpf::CALL_IMM, 0, 1, 0, 299)])
+        Ok(vec![insn(0, ebpf::CALL_IMM, 0, 0, 0, 299)])
     );
 }
 
@@ -522,14 +524,9 @@ fn test_tcp_sack() {
         enabled_sbpf_versions: SBPFVersion::V3..=SBPFVersion::V3,
         ..Config::default()
     };
-    let executable = assemble::<TestContextObject>(
-        TCP_SACK_ASM,
-        Arc::new(BuiltinProgram::new_loader(
-            config,
-            FunctionRegistry::default(),
-        )),
-    )
-    .unwrap();
+    let executable =
+        assemble::<TestContextObject>(TCP_SACK_ASM, Arc::new(BuiltinProgram::new_loader(config)))
+            .unwrap();
     let (_program_vm_addr, program) = executable.get_text_bytes();
     assert_eq!(program, TCP_SACK_BIN.to_vec());
 }

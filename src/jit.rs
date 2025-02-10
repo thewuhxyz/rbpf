@@ -1,4 +1,5 @@
-#![allow(clippy::arithmetic_side_effects)]
+//! Just-in-time compiler (Linux x86, macOS x86)
+
 // Derived from uBPF <https://github.com/iovisor/ubpf>
 // Copyright 2015 Big Switch Networks, Inc
 //      (uBPF: JIT algorithm, originally in C)
@@ -9,6 +10,8 @@
 // Licensed under the Apache License, Version 2.0 <http://www.apache.org/licenses/LICENSE-2.0> or
 // the MIT license <http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
+
+#![allow(clippy::arithmetic_side_effects)]
 
 #[cfg(not(feature = "shuttle-test"))]
 use rand::{thread_rng, Rng};
@@ -30,22 +33,31 @@ use crate::{
     memory_management::{
         allocate_pages, free_pages, get_system_page_size, protect_pages, round_to_page_size,
     },
-    memory_region::{AccessType, MemoryMapping},
+    memory_region::MemoryMapping,
     program::BuiltinFunction,
-    vm::{get_runtime_environment_key, Config, ContextObject, EbpfVm},
-    x86::*,
+    vm::{get_runtime_environment_key, Config, ContextObject, EbpfVm, RuntimeEnvironmentSlot},
+    x86::{
+        FenceType, X86IndirectAccess, X86Instruction,
+        X86Register::{self, *},
+        ARGUMENT_REGISTERS, CALLEE_SAVED_REGISTERS, CALLER_SAVED_REGISTERS,
+    },
 };
 
-const MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH: usize = 4096;
-const MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION: usize = 110;
-const MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT: usize = 13;
-const MAX_START_PADDING_LENGTH: usize = 256;
+/// The maximum machine code length in bytes of a program with no guest instructions
+pub const MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH: usize = 4096;
+/// The maximum machine code length in bytes of a single guest instruction
+pub const MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION: usize = 110;
+/// The maximum machine code length in bytes of an instruction meter checkpoint
+pub const MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT: usize = 24;
+/// The maximum machine code length of the randomized padding
+pub const MAX_START_PADDING_LENGTH: usize = 256;
 
+/// The program compiled to native host machinecode
 pub struct JitProgram {
     /// OS page size in bytes and the alignment of the sections
     page_size: usize,
-    /// A `*const u8` pointer into the text_section for each BPF instruction
-    pc_section: &'static mut [usize],
+    /// Byte offset in the text_section for each BPF instruction
+    pc_section: &'static mut [u32],
     /// The x86 machinecode
     text_section: &'static mut [u8],
 }
@@ -53,13 +65,13 @@ pub struct JitProgram {
 impl JitProgram {
     fn new(pc: usize, code_size: usize) -> Result<Self, EbpfError> {
         let page_size = get_system_page_size();
-        let pc_loc_table_size = round_to_page_size(pc * 8, page_size);
+        let pc_loc_table_size = round_to_page_size(pc * std::mem::size_of::<u32>(), page_size);
         let over_allocated_code_size = round_to_page_size(code_size, page_size);
         unsafe {
             let raw = allocate_pages(pc_loc_table_size + over_allocated_code_size)?;
             Ok(Self {
                 page_size,
-                pc_section: std::slice::from_raw_parts_mut(raw.cast::<usize>(), pc),
+                pc_section: std::slice::from_raw_parts_mut(raw.cast::<u32>(), pc),
                 text_section: std::slice::from_raw_parts_mut(
                     raw.add(pc_loc_table_size),
                     over_allocated_code_size,
@@ -73,7 +85,8 @@ impl JitProgram {
             return Ok(());
         }
         let raw = self.pc_section.as_ptr() as *mut u8;
-        let pc_loc_table_size = round_to_page_size(self.pc_section.len() * 8, self.page_size);
+        let pc_loc_table_size =
+            round_to_page_size(std::mem::size_of_val(self.pc_section), self.page_size);
         let over_allocated_code_size = round_to_page_size(self.text_section.len(), self.page_size);
         let code_size = round_to_page_size(text_section_usage, self.page_size);
         unsafe {
@@ -101,7 +114,7 @@ impl JitProgram {
         Ok(())
     }
 
-    pub fn invoke<C: ContextObject>(
+    pub(crate) fn invoke<C: ContextObject>(
         &self,
         _config: &Config,
         vm: &mut EbpfVm<C>,
@@ -135,7 +148,7 @@ impl JitProgram {
                 host_stack_pointer = in(reg) &mut vm.host_stack_pointer,
                 inlateout("rdi") std::ptr::addr_of_mut!(*vm).cast::<u64>().offset(get_runtime_environment_key() as isize) => _,
                 inlateout("r10") (vm.previous_instruction_meter as i64).wrapping_add(registers[11] as i64) => _,
-                inlateout("rax") self.pc_section[registers[11] as usize] => _,
+                inlateout("rax") &self.text_section[self.pc_section[registers[11] as usize] as usize & (i32::MAX as u32 as usize)] as *const u8 => _,
                 inlateout("r11") &registers => _,
                 lateout("rsi") _, lateout("rdx") _, lateout("rcx") _, lateout("r8") _,
                 lateout("r9") _, lateout("r12") _, lateout("r13") _, lateout("r14") _, lateout("r15") _,
@@ -144,12 +157,15 @@ impl JitProgram {
         }
     }
 
+    /// The length of the host machinecode in bytes
     pub fn machine_code_length(&self) -> usize {
         self.text_section.len()
     }
 
+    /// The total memory used in bytes rounded up to page boundaries
     pub fn mem_size(&self) -> usize {
-        let pc_loc_table_size = round_to_page_size(self.pc_section.len() * 8, self.page_size);
+        let pc_loc_table_size =
+            round_to_page_size(std::mem::size_of_val(self.pc_section), self.page_size);
         let code_size = round_to_page_size(self.text_section.len(), self.page_size);
         pc_loc_table_size + code_size
     }
@@ -157,7 +173,8 @@ impl JitProgram {
 
 impl Drop for JitProgram {
     fn drop(&mut self) {
-        let pc_loc_table_size = round_to_page_size(self.pc_section.len() * 8, self.page_size);
+        let pc_loc_table_size =
+            round_to_page_size(std::mem::size_of_val(self.pc_section), self.page_size);
         let code_size = round_to_page_size(self.text_section.len(), self.page_size);
         if pc_loc_table_size + code_size > 0 {
             unsafe {
@@ -194,15 +211,15 @@ const ANCHOR_CALL_DEPTH_EXCEEDED: usize = 6;
 const ANCHOR_CALL_OUTSIDE_TEXT_SEGMENT: usize = 7;
 const ANCHOR_DIV_BY_ZERO: usize = 8;
 const ANCHOR_DIV_OVERFLOW: usize = 9;
-const ANCHOR_CALL_UNSUPPORTED_INSTRUCTION: usize = 10;
-const ANCHOR_EXTERNAL_FUNCTION_CALL: usize = 11;
-const ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE: usize = 12;
-const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 13;
-const ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION: usize = 14;
+const ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION: usize = 10;
+const ANCHOR_CALL_UNSUPPORTED_INSTRUCTION: usize = 11;
+const ANCHOR_EXTERNAL_FUNCTION_CALL: usize = 12;
+const ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE: usize = 13;
+const ANCHOR_INTERNAL_FUNCTION_CALL_REG: usize = 14;
 const ANCHOR_TRANSLATE_MEMORY_ADDRESS: usize = 21;
-const ANCHOR_COUNT: usize = 30; // Update me when adding or removing anchors
+const ANCHOR_COUNT: usize = 34; // Update me when adding or removing anchors
 
-const REGISTER_MAP: [u8; 11] = [
+const REGISTER_MAP: [X86Register; 11] = [
     CALLER_SAVED_REGISTERS[0], // RAX
     ARGUMENT_REGISTERS[1],     // RSI
     ARGUMENT_REGISTERS[2],     // RDX
@@ -217,26 +234,32 @@ const REGISTER_MAP: [u8; 11] = [
 ];
 
 /// RDI: Used together with slot_in_vm()
-const REGISTER_PTR_TO_VM: u8 = ARGUMENT_REGISTERS[0];
+const REGISTER_PTR_TO_VM: X86Register = ARGUMENT_REGISTERS[0];
 /// R10: Program counter limit
-const REGISTER_INSTRUCTION_METER: u8 = CALLER_SAVED_REGISTERS[7];
+const REGISTER_INSTRUCTION_METER: X86Register = CALLER_SAVED_REGISTERS[7];
 /// R11: Scratch register
-const REGISTER_SCRATCH: u8 = CALLER_SAVED_REGISTERS[8];
+const REGISTER_SCRATCH: X86Register = CALLER_SAVED_REGISTERS[8];
 
+/// Bit width of an instruction operand
 #[derive(Copy, Clone, Debug)]
 pub enum OperandSize {
+    /// Empty
     S0 = 0,
+    /// 8 bit
     S8 = 8,
+    /// 16 bit
     S16 = 16,
+    /// 32 bit
     S32 = 32,
+    /// 64 bit
     S64 = 64,
 }
 
 enum Value {
-    Register(u8),
-    RegisterIndirect(u8, i32, bool),
-    RegisterPlusConstant32(u8, i32, bool),
-    RegisterPlusConstant64(u8, i64, bool),
+    Register(X86Register),
+    RegisterIndirect(X86Register, i32, bool),
+    RegisterPlusConstant32(X86Register, i32, bool),
+    RegisterPlusConstant64(X86Register, i64, bool),
     Constant64(i64, bool),
 }
 
@@ -249,20 +272,6 @@ struct Argument {
 struct Jump {
     location: *const u8,
     target_pc: usize,
-}
-
-/// Indices of slots inside RuntimeEnvironment
-enum RuntimeEnvironmentSlot {
-    HostStackPointer = 0,
-    CallDepth = 1,
-    ContextObjectPointer = 2,
-    PreviousInstructionMeter = 3,
-    DueInsnCount = 4,
-    StopwatchNumerator = 5,
-    StopwatchDenominator = 6,
-    Registers = 7,
-    ProgramResult = 19,
-    MemoryMapping = 27,
 }
 
 /* Explanation of the Instruction Meter
@@ -314,6 +323,7 @@ enum RuntimeEnvironmentSlot {
     and undo again can be anything, so we just set it to zero.
 */
 
+/// Temporary object which stores the compilation context
 pub struct JitCompiler<'a, C: ContextObject> {
     result: JitProgram,
     text_section_jumps: Vec<Jump>,
@@ -328,6 +338,7 @@ pub struct JitCompiler<'a, C: ContextObject> {
     next_noop_insertion: u32,
     noop_range: Uniform<u32>,
     runtime_environment_key: i32,
+    immediate_value_key: i64,
     diversification_rng: SmallRng,
     stopwatch_is_active: bool,
 }
@@ -365,6 +376,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
         let runtime_environment_key = get_runtime_environment_key();
         let mut diversification_rng = SmallRng::from_rng(thread_rng()).map_err(|_| EbpfError::JitNotCompiled)?;
+        let immediate_value_key = diversification_rng.gen::<i64>();
 
         Ok(Self {
             result: JitProgram::new(pc, code_length_estimate)?,
@@ -380,6 +392,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             next_noop_insertion: if config.noop_instruction_rate == 0 { u32::MAX } else { diversification_rng.gen_range(0..config.noop_instruction_rate * 2) },
             noop_range: Uniform::new_inclusive(0, config.noop_instruction_rate * 2),
             runtime_environment_key,
+            immediate_value_key,
             diversification_rng,
             stopwatch_is_active: false,
         })
@@ -387,8 +400,6 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     /// Compiles the given executable, consuming the compiler
     pub fn compile(mut self) -> Result<JitProgram, EbpfError> {
-        let text_section_base = self.result.text_section.as_ptr();
-
         // Randomized padding at the start before random intervals begin
         if self.config.noop_instruction_rate != 0 {
             for _ in 0..self.diversification_rng.gen_range(0..MAX_START_PADDING_LENGTH) {
@@ -399,12 +410,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
         self.emit_subroutines();
 
+        let mut function_iter = self.executable.get_function_registry().keys().map(|insn_ptr| insn_ptr as usize).peekable();
         while self.pc * ebpf::INSN_SIZE < self.program.len() {
             if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * 2 >= self.result.text_section.len() {
                 return Err(EbpfError::ExhaustedTextSegment(self.pc));
             }
             let mut insn = ebpf::get_insn_unchecked(self.program, self.pc);
-            self.result.pc_section[self.pc] = unsafe { text_section_base.add(self.offset_in_text_section) } as usize;
+            self.result.pc_section[self.pc] = self.offset_in_text_section as u32;
+            if self.executable.get_sbpf_version().static_syscalls() {
+                if function_iter.peek() == Some(&self.pc) {
+                    function_iter.next();
+                } else {
+                    self.result.pc_section[self.pc] |= 1 << 31;
+                }
+            }
 
             // Regular instruction meter checkpoints to prevent long linear runs from exceeding their budget
             if self.last_instruction_meter_validation_pc + self.config.instruction_meter_checkpoint_distance <= self.pc {
@@ -417,15 +436,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, 0));
             }
 
-            let dst = if insn.dst == FRAME_PTR_REG as u8 { u8::MAX } else { REGISTER_MAP[insn.dst as usize] };
+            let dst = REGISTER_MAP[insn.dst as usize];
             let src = REGISTER_MAP[insn.src as usize];
             let target_pc = (self.pc as isize + insn.off as isize + 1) as usize;
 
             match insn.opc {
                 ebpf::LD_DW_IMM if !self.executable.get_sbpf_version().disable_lddw() => {
-                    self.emit_validate_and_profile_instruction_count(false, Some(self.pc + 2));
+                    self.emit_validate_and_profile_instruction_count(Some(self.pc + 2));
                     self.pc += 1;
-                    self.result.pc_section[self.pc] = self.anchors[ANCHOR_CALL_UNSUPPORTED_INSTRUCTION] as usize;
+                    self.result.pc_section[self.pc] = unsafe { self.anchors[ANCHOR_CALL_UNSUPPORTED_INSTRUCTION].offset_from(self.result.text_section.as_ptr()) as u32 };
                     ebpf::augment_lddw_unchecked(self.program, &mut insn);
                     if self.should_sanitize_constant(insn.imm) {
                         self.emit_sanitized_load_immediate(dst, insn.imm);
@@ -480,18 +499,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::ADD32_IMM  => {
                     self.emit_sanitized_alu(OperandSize::S32, 0x01, 0, dst, insn.imm);
                     if !self.executable.get_sbpf_version().explicit_sign_extension_of_results() {
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, 0, None)); // sign extend i32 to i64
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, None)); // sign extend i32 to i64
                     }
                 },
                 ebpf::ADD32_REG  => {
-                    self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x01, src, dst, 0, None));
+                    self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x01, src, dst, None));
                     if !self.executable.get_sbpf_version().explicit_sign_extension_of_results() {
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, 0, None)); // sign extend i32 to i64
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, None)); // sign extend i32 to i64
                     }
                 },
                 ebpf::SUB32_IMM  => {
                     if self.executable.get_sbpf_version().swap_sub_reg_imm_operands() {
-                        self.emit_ins(X86Instruction::alu(OperandSize::S32, 0xf7, 3, dst, 0, None));
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0xf7, 3, dst, 0, None));
                         if insn.imm != 0 {
                             self.emit_sanitized_alu(OperandSize::S32, 0x01, 0, dst, insn.imm);
                         }
@@ -499,13 +518,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                         self.emit_sanitized_alu(OperandSize::S32, 0x29, 5, dst, insn.imm);
                     }
                     if !self.executable.get_sbpf_version().explicit_sign_extension_of_results() {
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, 0, None)); // sign extend i32 to i64
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, None)); // sign extend i32 to i64
                     }
                 },
                 ebpf::SUB32_REG  => {
-                    self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x29, src, dst, 0, None));
+                    self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x29, src, dst, None));
                     if !self.executable.get_sbpf_version().explicit_sign_extension_of_results() {
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, 0, None)); // sign extend i32 to i64
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, None)); // sign extend i32 to i64
                     }
                 },
                 ebpf::MUL32_IMM | ebpf::DIV32_IMM | ebpf::MOD32_IMM if !self.executable.get_sbpf_version().enable_pqr() =>
@@ -531,14 +550,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.emit_address_translation(Some(dst), Value::RegisterPlusConstant64(src, insn.off as i64, true), 2, None);
                 },
                 ebpf::OR32_IMM   => self.emit_sanitized_alu(OperandSize::S32, 0x09, 1, dst, insn.imm),
-                ebpf::OR32_REG   => self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x09, src, dst, 0, None)),
+                ebpf::OR32_REG   => self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x09, src, dst, None)),
                 ebpf::AND32_IMM  => self.emit_sanitized_alu(OperandSize::S32, 0x21, 4, dst, insn.imm),
-                ebpf::AND32_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x21, src, dst, 0, None)),
+                ebpf::AND32_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x21, src, dst, None)),
                 ebpf::LSH32_IMM  => self.emit_shift(OperandSize::S32, 4, REGISTER_SCRATCH, dst, Some(insn.imm)),
                 ebpf::LSH32_REG  => self.emit_shift(OperandSize::S32, 4, src, dst, None),
                 ebpf::RSH32_IMM  => self.emit_shift(OperandSize::S32, 5, REGISTER_SCRATCH, dst, Some(insn.imm)),
                 ebpf::RSH32_REG  => self.emit_shift(OperandSize::S32, 5, src, dst, None),
-                ebpf::NEG32      if !self.executable.get_sbpf_version().disable_neg() => self.emit_ins(X86Instruction::alu(OperandSize::S32, 0xf7, 3, dst, 0, None)),
+                ebpf::NEG32      if !self.executable.get_sbpf_version().disable_neg() => self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0xf7, 3, dst, 0, None)),
                 ebpf::LD_4B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
                     self.emit_address_translation(Some(dst), Value::RegisterPlusConstant64(src, insn.off as i64, true), 4, None);
                 },
@@ -546,7 +565,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.emit_address_translation(Some(dst), Value::RegisterPlusConstant64(src, insn.off as i64, true), 8, None);
                 },
                 ebpf::XOR32_IMM  => self.emit_sanitized_alu(OperandSize::S32, 0x31, 6, dst, insn.imm),
-                ebpf::XOR32_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x31, src, dst, 0, None)),
+                ebpf::XOR32_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x31, src, dst, None)),
                 ebpf::MOV32_IMM  => {
                     if self.should_sanitize_constant(insn.imm) {
                         self.emit_sanitized_load_immediate(dst, insn.imm as u32 as u64 as i64);
@@ -566,10 +585,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::LE if !self.executable.get_sbpf_version().disable_le() => {
                     match insn.imm {
                         16 => {
-                            self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x81, 4, dst, 0xffff, None)); // Mask to 16 bit
+                            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, dst, 0xffff, None)); // Mask to 16 bit
                         }
                         32 => {
-                            self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x81, 4, dst, -1, None)); // Mask to 32 bit
+                            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, dst, -1, None)); // Mask to 32 bit
                         }
                         64 => {}
                         _ => {
@@ -581,7 +600,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     match insn.imm {
                         16 => {
                             self.emit_ins(X86Instruction::bswap(OperandSize::S16, dst));
-                            self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x81, 4, dst, 0xffff, None)); // Mask to 16 bit
+                            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, dst, 0xffff, None)); // Mask to 16 bit
                         }
                         32 => self.emit_ins(X86Instruction::bswap(OperandSize::S32, dst)),
                         64 => self.emit_ins(X86Instruction::bswap(OperandSize::S64, dst)),
@@ -593,10 +612,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
                 // BPF_ALU64_STORE class
                 ebpf::ADD64_IMM  => self.emit_sanitized_alu(OperandSize::S64, 0x01, 0, dst, insn.imm),
-                ebpf::ADD64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, src, dst, 0, None)),
+                ebpf::ADD64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, src, dst, None)),
                 ebpf::SUB64_IMM  => {
                     if self.executable.get_sbpf_version().swap_sub_reg_imm_operands() {
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xf7, 3, dst, 0, None));
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 3, dst, 0, None));
                         if insn.imm != 0 {
                             self.emit_sanitized_alu(OperandSize::S64, 0x01, 0, dst, insn.imm);
                         }
@@ -604,7 +623,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                         self.emit_sanitized_alu(OperandSize::S64, 0x29, 5, dst, insn.imm);
                     }
                 }
-                ebpf::SUB64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, src, dst, 0, None)),
+                ebpf::SUB64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, src, dst, None)),
                 ebpf::MUL64_IMM | ebpf::DIV64_IMM | ebpf::MOD64_IMM if !self.executable.get_sbpf_version().enable_pqr() =>
                     self.emit_product_quotient_remainder(
                         OperandSize::S64,
@@ -634,9 +653,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.emit_address_translation(None, Value::RegisterPlusConstant64(dst, insn.off as i64, true), 2, Some(Value::Register(src)));
                 },
                 ebpf::OR64_IMM   => self.emit_sanitized_alu(OperandSize::S64, 0x09, 1, dst, insn.imm),
-                ebpf::OR64_REG   => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, src, dst, 0, None)),
+                ebpf::OR64_REG   => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, src, dst, None)),
                 ebpf::AND64_IMM  => self.emit_sanitized_alu(OperandSize::S64, 0x21, 4, dst, insn.imm),
-                ebpf::AND64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x21, src, dst, 0, None)),
+                ebpf::AND64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x21, src, dst, None)),
                 ebpf::LSH64_IMM  => self.emit_shift(OperandSize::S64, 4, REGISTER_SCRATCH, dst, Some(insn.imm)),
                 ebpf::LSH64_REG  => self.emit_shift(OperandSize::S64, 4, src, dst, None),
                 ebpf::RSH64_IMM  => self.emit_shift(OperandSize::S64, 5, REGISTER_SCRATCH, dst, Some(insn.imm)),
@@ -644,7 +663,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 ebpf::ST_4B_IMM  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
                     self.emit_address_translation(None, Value::RegisterPlusConstant64(dst, insn.off as i64, true), 4, Some(Value::Constant64(insn.imm, true)));
                 },
-                ebpf::NEG64      if !self.executable.get_sbpf_version().disable_neg() => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xf7, 3, dst, 0, None)),
+                ebpf::NEG64      if !self.executable.get_sbpf_version().disable_neg() => self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 3, dst, 0, None)),
                 ebpf::ST_4B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
                     self.emit_address_translation(None, Value::RegisterPlusConstant64(dst, insn.off as i64, true), 4, Some(Value::Register(src)));
                 },
@@ -655,7 +674,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     self.emit_address_translation(None, Value::RegisterPlusConstant64(dst, insn.off as i64, true), 8, Some(Value::Register(src)));
                 },
                 ebpf::XOR64_IMM  => self.emit_sanitized_alu(OperandSize::S64, 0x31, 6, dst, insn.imm),
-                ebpf::XOR64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x31, src, dst, 0, None)),
+                ebpf::XOR64_REG  => self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x31, src, dst, None)),
                 ebpf::MOV64_IMM  => {
                     if self.should_sanitize_constant(insn.imm) {
                         self.emit_sanitized_load_immediate(dst, insn.imm);
@@ -702,7 +721,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
                 // BPF_JMP class
                 ebpf::JA         => {
-                    self.emit_validate_and_profile_instruction_count(true, Some(target_pc));
+                    self.emit_validate_and_profile_instruction_count(Some(target_pc));
                     self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, target_pc as i64));
                     let jump_offset = self.relative_to_target_pc(target_pc, 5);
                     self.emit_ins(X86Instruction::jump_immediate(jump_offset));
@@ -733,7 +752,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     // For JIT, external functions MUST be registered at compile time.
                     if let (false, Some((_, function))) =
                             (self.executable.get_sbpf_version().static_syscalls(),
-                                self.executable.get_loader().get_function_registry(self.executable.get_sbpf_version()).lookup_by_key(insn.imm as u32)) {
+                                self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32)) {
                         // SBPFv0 syscall
                         self.emit_syscall_dispatch(function);
                     } else if let Some((_function_name, target_pc)) =
@@ -753,7 +772,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     }
                 },
                 ebpf::SYSCALL if self.executable.get_sbpf_version().static_syscalls() => {
-                    if let Some((_, function)) = self.executable.get_loader().get_function_registry(self.executable.get_sbpf_version()).lookup_by_key(insn.imm as u32) {
+                    if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
                         self.emit_syscall_dispatch(function);
                     } else {
                         debug_assert!(false, "Invalid syscall should have been detected in the verifier.")
@@ -773,22 +792,18 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                         || (insn.opc == ebpf::RETURN && !self.executable.get_sbpf_version().static_syscalls()) {
                         return Err(EbpfError::UnsupportedInstruction);
                     }
-                    self.emit_validate_instruction_count(Some(self.pc));
+                    self.emit_validate_and_profile_instruction_count(Some(0));
 
                     let call_depth_access = X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::CallDepth));
                     // If env.call_depth == 0, we've reached the exit instruction of the entry point
                     self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S32, REGISTER_PTR_TO_VM, 0, Some(call_depth_access)));
-                    if self.config.enable_instruction_meter {
-                        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64));
-                    }
                     // we're done
                     self.emit_ins(X86Instruction::conditional_jump_immediate(0x84, self.relative_to_anchor(ANCHOR_EXIT, 6)));
 
                     // else decrement and update env.call_depth
-                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, REGISTER_PTR_TO_VM, 1, Some(call_depth_access))); // env.call_depth -= 1;
+                    self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, REGISTER_PTR_TO_VM, 1, Some(call_depth_access))); // env.call_depth -= 1;
 
                     // and return
-                    self.emit_profile_instruction_count(false, Some(0));
                     self.emit_ins(X86Instruction::return_near());
                 },
 
@@ -802,7 +817,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if self.offset_in_text_section + MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION * 2 >= self.result.text_section.len() {
             return Err(EbpfError::ExhaustedTextSegment(self.pc));
         }
-        self.emit_validate_and_profile_instruction_count(false, Some(self.pc + 1));
+        self.emit_validate_and_profile_instruction_count(Some(self.pc + 1));
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.pc as i64)); // Save pc
         self.emit_set_exception_kind(EbpfError::ExecutionOverrun);
         self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5)));
@@ -860,7 +875,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     // This function helps the optimizer to inline the machinecode emission while avoiding stack allocations
     #[inline(always)]
-    pub fn emit_ins(&mut self, instruction: X86Instruction) {
+    fn emit_ins(&mut self, instruction: X86Instruction) {
         instruction.emit(self);
         if self.next_noop_insertion == 0 {
             self.next_noop_insertion = self.noop_range.sample(&mut self.diversification_rng);
@@ -872,43 +887,38 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     }
 
     #[inline]
-    fn emit_sanitized_load_immediate(&mut self, destination: u8, value: i64) {
+    fn emit_sanitized_load_immediate(&mut self, destination: X86Register, value: i64) {
+        let lower_key = self.immediate_value_key as i32 as i64;
         if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
-            let key = self.diversification_rng.gen::<i32>() as i64;
-            self.emit_ins(X86Instruction::load_immediate(destination, value.wrapping_sub(key)));
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, destination, key, None));
+            self.emit_ins(X86Instruction::load_immediate(destination, value.wrapping_sub(lower_key)));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, destination, lower_key, None)); // wrapping_add(lower_key)
         } else if value as u64 & u32::MAX as u64 == 0 {
-            let key = self.diversification_rng.gen::<i32>() as i64;
-            self.emit_ins(X86Instruction::load_immediate(destination, value.rotate_right(32).wrapping_sub(key)));
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, destination, key, None)); // wrapping_add(key)
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xc1, 4, destination, 32, None)); // shift_left(32)
+            self.emit_ins(X86Instruction::load_immediate(destination, value.rotate_right(32).wrapping_sub(lower_key)));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, destination, lower_key, None)); // wrapping_add(lower_key)
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, destination, 32, None)); // shift_left(32)
+        } else if destination != REGISTER_SCRATCH {
+            self.emit_ins(X86Instruction::load_immediate(destination, value.wrapping_sub(self.immediate_value_key)));
+            self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.immediate_value_key));
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, destination, None)); // wrapping_add(immediate_value_key)
         } else {
-            let key = self.diversification_rng.gen::<i64>();
-            if destination != REGISTER_SCRATCH {
-                self.emit_ins(X86Instruction::load_immediate(destination, value.wrapping_sub(key)));
-                self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, key));
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, destination, 0, None));
-            } else {
-                let lower_key = key as i32 as i64;
-                let upper_key = (key >> 32) as i32 as i64;
-                self.emit_ins(X86Instruction::load_immediate(destination, value.wrapping_sub(lower_key).rotate_right(32).wrapping_sub(upper_key)));
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, destination, upper_key, None)); // wrapping_add(upper_key)
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xc1, 1, destination, 32, None)); // rotate_right(32)
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, destination, lower_key, None)); // wrapping_add(lower_key)
-            }
+            let upper_key = (self.immediate_value_key >> 32) as i32 as i64;
+            self.emit_ins(X86Instruction::load_immediate(destination, value.wrapping_sub(lower_key).rotate_right(32).wrapping_sub(upper_key)));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, destination, upper_key, None)); // wrapping_add(upper_key)
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 1, destination, 32, None)); // rotate_right(32)
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, destination, lower_key, None)); // wrapping_add(lower_key)
         }
     }
 
     #[inline]
-    fn emit_sanitized_alu(&mut self, size: OperandSize, opcode: u8, opcode_extension: u8, destination: u8, immediate: i64) {
+    fn emit_sanitized_alu(&mut self, size: OperandSize, opcode: u8, opcode_extension: u8, destination: X86Register, immediate: i64) {
         if self.should_sanitize_constant(immediate) {
             self.emit_sanitized_load_immediate(REGISTER_SCRATCH, immediate);
-            self.emit_ins(X86Instruction::alu(size, opcode, REGISTER_SCRATCH, destination, 0, None));
+            self.emit_ins(X86Instruction::alu(size, opcode, REGISTER_SCRATCH, destination, None));
         } else if immediate >= i32::MIN as i64 && immediate <= i32::MAX as i64 {
-            self.emit_ins(X86Instruction::alu(size, 0x81, opcode_extension, destination, immediate, None));
+            self.emit_ins(X86Instruction::alu_immediate(size, 0x81, opcode_extension, destination, immediate, None));
         } else {
             self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, immediate));
-            self.emit_ins(X86Instruction::alu(size, opcode, REGISTER_SCRATCH, destination, 0, None));
+            self.emit_ins(X86Instruction::alu(size, opcode, REGISTER_SCRATCH, destination, None));
         }
     }
 
@@ -921,13 +931,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::fence(FenceType::Load)); // lfence
         self.emit_ins(X86Instruction::cycle_count()); // rdtsc
         self.emit_ins(X86Instruction::fence(FenceType::Load)); // lfence
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xc1, 4, RDX, 32, None)); // RDX <<= 32;
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, RAX, 0, None)); // RAX |= RDX;
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, RDX, 32, None)); // RDX <<= 32;
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, RAX, None)); // RAX |= RDX;
         if begin {
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RAX, REGISTER_PTR_TO_VM, 0, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::StopwatchNumerator))))); // *numerator -= RAX;
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RAX, REGISTER_PTR_TO_VM, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::StopwatchNumerator))))); // *numerator -= RAX;
         } else {
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RAX, REGISTER_PTR_TO_VM, 0, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::StopwatchNumerator))))); // *numerator += RAX;
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, REGISTER_PTR_TO_VM, 1, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::StopwatchDenominator))))); // *denominator += 1;
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RAX, REGISTER_PTR_TO_VM, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::StopwatchNumerator))))); // *numerator += RAX;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, REGISTER_PTR_TO_VM, 1, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::StopwatchDenominator))))); // *denominator += 1;
         }
         self.emit_ins(X86Instruction::pop(RAX));
         self.emit_ins(X86Instruction::pop(RDX));
@@ -941,61 +951,43 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Update `MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT` if you change the code generation here
         if let Some(pc) = pc {
             self.last_instruction_meter_validation_pc = pc;
-            // instruction_meter >= self.pc
-            self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, REGISTER_INSTRUCTION_METER, pc as i64, None));
-        } else {
-            // instruction_meter >= scratch_register
-            self.emit_ins(X86Instruction::cmp(OperandSize::S64, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, None));
+            self.emit_sanitized_load_immediate(REGISTER_SCRATCH, pc as i64);
         }
+        // If instruction_meter >= pc, throw ExceededMaxInstructions
+        self.emit_ins(X86Instruction::cmp(OperandSize::S64, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, None));
         self.emit_ins(X86Instruction::conditional_jump_immediate(0x86, self.relative_to_anchor(ANCHOR_THROW_EXCEEDED_MAX_INSTRUCTIONS, 6)));
     }
 
     #[inline]
-    fn emit_profile_instruction_count(&mut self, user_provided: bool, target_pc: Option<usize>) {
+    fn emit_profile_instruction_count(&mut self, target_pc: Option<usize>) {
         if !self.config.enable_instruction_meter {
             return;
         }
         match target_pc {
             Some(target_pc) => {
-                // instruction_meter += target_pc - (self.pc + 1);
-                let immediate = target_pc as i64 - self.pc as i64 - 1;
-                if user_provided {
-                    self.emit_sanitized_alu(OperandSize::S64, 0x01, 0, REGISTER_INSTRUCTION_METER, immediate);
-                } else {
-                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, REGISTER_INSTRUCTION_METER, immediate, None));
-                }
+                self.emit_sanitized_alu(OperandSize::S64, 0x01, 0, REGISTER_INSTRUCTION_METER, target_pc as i64 - self.pc as i64 - 1); // instruction_meter += target_pc - (self.pc + 1);
             },
             None => {
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, REGISTER_INSTRUCTION_METER, self.pc as i64 + 1, None)); // instruction_meter -= self.pc + 1;
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, 0, None)); // instruction_meter += target_pc;
+                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, None)); // instruction_meter += target_pc;
+                self.emit_sanitized_alu(OperandSize::S64, 0x81, 5, REGISTER_INSTRUCTION_METER, self.pc as i64 + 1); // instruction_meter -= self.pc + 1;
             },
         }
     }
 
     #[inline]
-    fn emit_validate_and_profile_instruction_count(&mut self, user_provided: bool, target_pc: Option<usize>) {
-        self.emit_validate_instruction_count(Some(self.pc));
-        self.emit_profile_instruction_count(user_provided, target_pc);
-    }
-
-    #[inline]
-    fn emit_undo_profile_instruction_count(&mut self, target_pc: Value) {
+    fn emit_undo_profile_instruction_count(&mut self, target_pc: usize) {
         if self.config.enable_instruction_meter {
-            match target_pc {
-                Value::Constant64(target_pc, _) => {
-                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, REGISTER_INSTRUCTION_METER, self.pc as i64 + 1 - target_pc, None)); // instruction_meter += (self.pc + 1) - target_pc;
-                }
-                Value::Register(target_pc) => {
-                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, target_pc, REGISTER_INSTRUCTION_METER, 0, None)); // instruction_meter -= guest_target_pc
-                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, REGISTER_INSTRUCTION_METER, 1, None)); // instruction_meter += 1
-                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, 0, None)); // instruction_meter += self.pc
-                }
-                _ => debug_assert!(false),
-            }
+            self.emit_sanitized_alu(OperandSize::S64, 0x01, 0, REGISTER_INSTRUCTION_METER, self.pc as i64 + 1 - target_pc as i64); // instruction_meter += (self.pc + 1) - target_pc;
         }
     }
 
-    fn emit_rust_call(&mut self, target: Value, arguments: &[Argument], result_reg: Option<u8>) {
+    #[inline]
+    fn emit_validate_and_profile_instruction_count(&mut self, target_pc: Option<usize>) {
+        self.emit_validate_instruction_count(Some(self.pc));
+        self.emit_profile_instruction_count(target_pc);
+    }
+
+    fn emit_rust_call(&mut self, target: Value, arguments: &[Argument], result_reg: Option<X86Register>) {
         let mut saved_registers = CALLER_SAVED_REGISTERS.to_vec();
         if let Some(reg) = result_reg {
             if let Some(dst) = saved_registers.iter().position(|x| *x == reg) {
@@ -1011,20 +1003,20 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Align RSP to 16 bytes
         self.emit_ins(X86Instruction::push(RSP, None));
         self.emit_ins(X86Instruction::push(RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0))));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 4, RSP, -16, None));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 4, RSP, -16, None));
 
         let stack_arguments = arguments.len().saturating_sub(ARGUMENT_REGISTERS.len()) as i64;
         if stack_arguments % 2 != 0 {
             // If we're going to pass an odd number of stack args we need to pad
             // to preserve alignment
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, RSP, 8, None));
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 8, None));
         }
 
         // Pass arguments
         for argument in arguments {
             let is_stack_argument = argument.index >= ARGUMENT_REGISTERS.len();
             let dst = if is_stack_argument {
-                u8::MAX // Never used
+                RSP // Never used
             } else {
                 ARGUMENT_REGISTERS[argument.index]
             };
@@ -1039,7 +1031,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 Value::RegisterIndirect(reg, offset, user_provided) => {
                     debug_assert!(!user_provided);
                     if is_stack_argument {
-                        debug_assert_ne!(reg, RSP);
+                        debug_assert!(reg != RSP);
                         self.emit_ins(X86Instruction::push(reg, Some(X86IndirectAccess::Offset(offset))));
                     } else if reg == RSP {
                         self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, dst, X86IndirectAccess::OffsetIndexShift(offset, RSP, 0)));
@@ -1051,7 +1043,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     debug_assert!(!user_provided);
                     if is_stack_argument {
                         self.emit_ins(X86Instruction::push(reg, None));
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RSP, offset as i64, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0))));
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, offset as i64, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0))));
                     } else if reg == RSP {
                         self.emit_ins(X86Instruction::lea(OperandSize::S64, RSP, dst, Some(X86IndirectAccess::OffsetIndexShift(offset, RSP, 0))));
                     } else {
@@ -1062,10 +1054,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     debug_assert!(!user_provided);
                     if is_stack_argument {
                         self.emit_ins(X86Instruction::push(reg, None));
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RSP, offset, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0))));
+                        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, offset, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0))));
                     } else {
                         self.emit_ins(X86Instruction::load_immediate(dst, offset));
-                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, dst, 0, None));
+                        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, dst, None));
                     }
                 },
                 Value::Constant64(value, user_provided) => {
@@ -1096,7 +1088,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
     
         // Restore registers from stack
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RSP,
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP,
             if stack_arguments % 2 != 0 { stack_arguments + 1 } else { stack_arguments } * 8, None));
         self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, RSP, X86IndirectAccess::OffsetIndexShift(8, RSP, 0)));
 
@@ -1123,7 +1115,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             },
             Value::Constant64(target_pc, user_provided) => {
                 debug_assert!(user_provided);
-                self.emit_profile_instruction_count(user_provided, Some(target_pc as usize));
+                self.emit_profile_instruction_count(Some(target_pc as usize));
                 if user_provided && self.should_sanitize_constant(target_pc) {
                     self.emit_sanitized_load_immediate(REGISTER_SCRATCH, target_pc);
                 } else {
@@ -1138,7 +1130,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             }
         }
 
-        self.emit_undo_profile_instruction_count(Value::Constant64(0, false));
+        self.emit_undo_profile_instruction_count(0);
 
         // Restore the previous frame pointer
         self.emit_ins(X86Instruction::pop(REGISTER_MAP[FRAME_PTR_REG]));
@@ -1149,14 +1141,14 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     #[inline]
     fn emit_syscall_dispatch(&mut self, function: BuiltinFunction<C>) {
-        self.emit_validate_and_profile_instruction_count(false, Some(0));
+        self.emit_validate_and_profile_instruction_count(Some(0));
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, function as usize as i64));
         self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(ANCHOR_EXTERNAL_FUNCTION_CALL, 5)));
-        self.emit_undo_profile_instruction_count(Value::Constant64(0, false));
+        self.emit_undo_profile_instruction_count(0);
     }
 
     #[inline]
-    fn emit_address_translation(&mut self, dst: Option<u8>, vm_addr: Value, len: u64, value: Option<Value>) {
+    fn emit_address_translation(&mut self, dst: Option<X86Register>, vm_addr: Value, len: u64, value: Option<Value>) {
         debug_assert_ne!(dst.is_some(), value.is_some());
 
         let stack_slot_of_value_to_store = X86IndirectAccess::OffsetIndexShift(-112, RSP, 0);
@@ -1165,11 +1157,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_ins(X86Instruction::store(OperandSize::S64, reg, RSP, stack_slot_of_value_to_store));
             }
             Some(Value::Constant64(constant, user_provided)) => {
-                if user_provided && self.should_sanitize_constant(constant) {
-                    self.emit_sanitized_load_immediate(REGISTER_SCRATCH, constant);
-                } else {
-                    self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, constant));
-                }
+                debug_assert!(user_provided);
+                // First half of emit_sanitized_load_immediate(stack_slot_of_value_to_store, constant)
+                let lower_key = self.immediate_value_key as i32 as i64;
+                self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, constant.wrapping_sub(lower_key)));
                 self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_SCRATCH, RSP, stack_slot_of_value_to_store));
             }
             _ => {}
@@ -1182,14 +1173,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 } else {
                     self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, constant));
                 }
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, REGISTER_SCRATCH, 0, None));
-            },
-            Value::Constant64(constant, user_provided) => {
-                if user_provided && self.should_sanitize_constant(constant) {
-                    self.emit_sanitized_load_immediate(REGISTER_SCRATCH, constant);
-                } else {
-                    self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, constant));
-                }
+                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, REGISTER_SCRATCH, None));
             },
             _ => {
                 #[cfg(debug_assertions)]
@@ -1198,8 +1182,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
 
         if self.config.enable_address_translation {
-            let access_type = if value.is_none() { AccessType::Load } else { AccessType::Store };
-            let anchor = ANCHOR_TRANSLATE_MEMORY_ADDRESS + len.trailing_zeros() as usize + 4 * (access_type as usize);
+            let anchor_base = match value {
+                Some(Value::Register(_reg)) => 4,
+                Some(Value::Constant64(_constant, _user_provided)) => 8,
+                _ => 0,
+            };
+            let anchor = ANCHOR_TRANSLATE_MEMORY_ADDRESS + anchor_base + len.trailing_zeros() as usize;
             self.emit_ins(X86Instruction::push_immediate(OperandSize::S64, self.pc as i32));
             self.emit_ins(X86Instruction::call_immediate(self.relative_to_anchor(anchor, 5)));
             if let Some(dst) = dst {
@@ -1227,8 +1215,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     }
 
     #[inline]
-    fn emit_conditional_branch_reg(&mut self, op: u8, bitwise: bool, first_operand: u8, second_operand: u8, target_pc: usize) {
-        self.emit_validate_and_profile_instruction_count(true, Some(target_pc));
+    fn emit_conditional_branch_reg(&mut self, op: u8, bitwise: bool, first_operand: X86Register, second_operand: X86Register, target_pc: usize) {
+        self.emit_validate_and_profile_instruction_count(Some(target_pc));
         if bitwise { // Logical
             self.emit_ins(X86Instruction::test(OperandSize::S64, first_operand, second_operand, None));
         } else { // Arithmetic
@@ -1237,12 +1225,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, target_pc as i64));
         let jump_offset = self.relative_to_target_pc(target_pc, 6);
         self.emit_ins(X86Instruction::conditional_jump_immediate(op, jump_offset));
-        self.emit_undo_profile_instruction_count(Value::Constant64(target_pc as i64, true));
+        self.emit_undo_profile_instruction_count(target_pc);
     }
 
     #[inline]
-    fn emit_conditional_branch_imm(&mut self, op: u8, bitwise: bool, immediate: i64, second_operand: u8, target_pc: usize) {
-        self.emit_validate_and_profile_instruction_count(true, Some(target_pc));
+    fn emit_conditional_branch_imm(&mut self, op: u8, bitwise: bool, immediate: i64, second_operand: X86Register, target_pc: usize) {
+        self.emit_validate_and_profile_instruction_count(Some(target_pc));
         if self.should_sanitize_constant(immediate) {
             self.emit_sanitized_load_immediate(REGISTER_SCRATCH, immediate);
             if bitwise { // Logical
@@ -1258,43 +1246,29 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, target_pc as i64));
         let jump_offset = self.relative_to_target_pc(target_pc, 6);
         self.emit_ins(X86Instruction::conditional_jump_immediate(op, jump_offset));
-        self.emit_undo_profile_instruction_count(Value::Constant64(target_pc as i64, true));
+        self.emit_undo_profile_instruction_count(target_pc);
     }
 
-    fn emit_shift(&mut self, size: OperandSize, opcode_extension: u8, source: u8, destination: u8, immediate: Option<i64>) {
+    fn emit_shift(&mut self, size: OperandSize, opcode_extension: u8, source: X86Register, destination: X86Register, immediate: Option<i64>) {
         if let Some(immediate) = immediate {
-            if self.should_sanitize_constant(immediate) {
-                self.emit_sanitized_load_immediate(source, immediate);
-            } else {
-                self.emit_ins(X86Instruction::alu(size, 0xc1, opcode_extension, destination, immediate, None));
-                return;
-            }
+            self.emit_ins(X86Instruction::alu_immediate(size, 0xc1, opcode_extension, destination, immediate, None));
+            return;
         }
         if let OperandSize::S32 = size {
-            self.emit_ins(X86Instruction::alu(OperandSize::S32, 0x81, 4, destination, -1, None)); // Mask to 32 bit
+            self.emit_ins(X86Instruction::mov(OperandSize::S32, destination, destination)); // Truncate to 32 bit
         }
         if source == RCX {
-            if destination == RCX {
-                self.emit_ins(X86Instruction::alu(size, 0xd3, opcode_extension, destination, 0, None));
-            } else {
-                self.emit_ins(X86Instruction::push(RCX, None));
-                self.emit_ins(X86Instruction::alu(size, 0xd3, opcode_extension, destination, 0, None));
-                self.emit_ins(X86Instruction::pop(RCX));
-            }
+            self.emit_ins(X86Instruction::alu_immediate(size, 0xd3, opcode_extension, destination, 0, None));
         } else if destination == RCX {
-            if source != REGISTER_SCRATCH {
-                self.emit_ins(X86Instruction::push(source, None));
-            }
+            self.emit_ins(X86Instruction::push(source, None));
             self.emit_ins(X86Instruction::xchg(OperandSize::S64, source, RCX, None));
-            self.emit_ins(X86Instruction::alu(size, 0xd3, opcode_extension, source, 0, None));
+            self.emit_ins(X86Instruction::alu_immediate(size, 0xd3, opcode_extension, source, 0, None));
             self.emit_ins(X86Instruction::mov(OperandSize::S64, source, RCX));
-            if source != REGISTER_SCRATCH {
-                self.emit_ins(X86Instruction::pop(source));
-            }
+            self.emit_ins(X86Instruction::pop(source));
         } else {
             self.emit_ins(X86Instruction::push(RCX, None));
             self.emit_ins(X86Instruction::mov(OperandSize::S64, source, RCX));
-            self.emit_ins(X86Instruction::alu(size, 0xd3, opcode_extension, destination, 0, None));
+            self.emit_ins(X86Instruction::alu_immediate(size, 0xd3, opcode_extension, destination, 0, None));
             self.emit_ins(X86Instruction::pop(RCX));
         }
     }
@@ -1306,8 +1280,8 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         alt_dst: bool,
         division: bool,
         signed: bool,
-        src: u8,
-        dst: u8,
+        src: X86Register,
+        dst: X86Register,
         imm: Option<i64>,
     ) {
         //         LMUL UHMUL SHMUL UDIV SDIV UREM SREM
@@ -1367,11 +1341,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             if signed {
                 self.emit_ins(X86Instruction::sign_extend_rax_rdx(size));
             } else {
-                self.emit_ins(X86Instruction::alu(size, 0x31, RDX, RDX, 0, None)); // RDX = 0
+                self.emit_ins(X86Instruction::alu(size, 0x31, RDX, RDX, None)); // RDX = 0
             }
         }
 
-        self.emit_ins(X86Instruction::alu(size, 0xf7, 0x4 | (division as u8) << 1 | signed as u8, REGISTER_SCRATCH, 0, None));
+        self.emit_ins(X86Instruction::alu_immediate(size, 0xf7, 0x4 | ((division as u8) << 1) | signed as u8, REGISTER_SCRATCH, 0, None));
 
         if dst != RDX {
             if alt_dst {
@@ -1387,7 +1361,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         if let OperandSize::S32 = size {
             if signed && !self.executable.get_sbpf_version().explicit_sign_extension_of_results() {
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, 0, None)); // sign extend i32 to i64
+                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x63, dst, dst, None)); // sign extend i32 to i64
             }
         }
     }
@@ -1400,7 +1374,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::store_immediate(OperandSize::S64, REGISTER_MAP[0], X86IndirectAccess::Offset(std::mem::size_of::<u64>() as i32), err_kind as i64)); // err.kind = err_kind;
     }
 
-    fn emit_result_is_err(&mut self, destination: u8) {
+    fn emit_result_is_err(&mut self, destination: X86Register) {
         let ok = ProgramResult::Ok(0);
         let ok_discriminant = ok.discriminant();
         self.emit_ins(X86Instruction::lea(OperandSize::S64, REGISTER_PTR_TO_VM, destination, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult)))));
@@ -1417,15 +1391,15 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                 self.emit_ins(X86Instruction::push(*reg, None));
             }
             self.emit_ins(X86Instruction::mov(OperandSize::S64, RSP, REGISTER_MAP[0]));
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RSP, - 8 * 3, None)); // RSP -= 8 * 3;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, - 8 * 3, None)); // RSP -= 8 * 3;
             self.emit_rust_call(Value::Constant64(C::trace as *const u8 as i64, false), &[
                 Argument { index: 1, value: Value::Register(REGISTER_MAP[0]) }, // registers
                 Argument { index: 0, value: Value::RegisterIndirect(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ContextObjectPointer), false) },
             ], None);
             // Pop stack and return
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RSP, 8 * 3, None)); // RSP += 8 * 3;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8 * 3, None)); // RSP += 8 * 3;
             self.emit_ins(X86Instruction::pop(REGISTER_MAP[0]));
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, RSP, 8 * (REGISTER_MAP.len() - 1) as i64, None)); // RSP += 8 * (REGISTER_MAP.len() - 1);
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8 * (REGISTER_MAP.len() - 1) as i64, None)); // RSP += 8 * (REGISTER_MAP.len() - 1);
             self.emit_ins(X86Instruction::pop(REGISTER_SCRATCH));
             self.emit_ins(X86Instruction::return_near());
         }
@@ -1433,11 +1407,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Epilogue
         self.set_anchor(ANCHOR_EPILOGUE);
         if self.config.enable_instruction_meter {
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, REGISTER_INSTRUCTION_METER, 1, None)); // REGISTER_INSTRUCTION_METER -= 1;
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER -= pc;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, REGISTER_INSTRUCTION_METER, 1, None)); // REGISTER_INSTRUCTION_METER -= 1;
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, None)); // REGISTER_INSTRUCTION_METER -= pc;
             // *DueInsnCount = *PreviousInstructionMeter - REGISTER_INSTRUCTION_METER;
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2B, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, 0, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::PreviousInstructionMeter))))); // REGISTER_INSTRUCTION_METER -= *PreviousInstructionMeter;
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xf7, 3, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER = -REGISTER_INSTRUCTION_METER;
+            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2B, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::PreviousInstructionMeter))))); // REGISTER_INSTRUCTION_METER -= *PreviousInstructionMeter;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xf7, 3, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER = -REGISTER_INSTRUCTION_METER;
             self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_INSTRUCTION_METER, REGISTER_PTR_TO_VM, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::DueInsnCount)))); // *DueInsnCount = REGISTER_INSTRUCTION_METER;
         }
         // Print stop watch value
@@ -1468,11 +1442,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Quit gracefully
         self.set_anchor(ANCHOR_EXIT);
         if self.config.enable_instruction_meter {
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, 0, None)); // REGISTER_INSTRUCTION_METER -= pc;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, REGISTER_INSTRUCTION_METER, 1, None)); // REGISTER_INSTRUCTION_METER += 1;
         }
         self.emit_ins(X86Instruction::lea(OperandSize::S64, REGISTER_PTR_TO_VM, REGISTER_SCRATCH, Some(X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult)))));
         self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_MAP[0], REGISTER_SCRATCH, X86IndirectAccess::Offset(std::mem::size_of::<u64>() as i32))); // result.return_value = R0;
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x31, REGISTER_SCRATCH, REGISTER_SCRATCH, 0, None)); // REGISTER_SCRATCH ^= REGISTER_SCRATCH; // REGISTER_SCRATCH = 0;
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x31, REGISTER_SCRATCH, REGISTER_SCRATCH, None)); // REGISTER_SCRATCH ^= REGISTER_SCRATCH; // REGISTER_SCRATCH = 0;
         self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_EPILOGUE, 5)));
 
         // Handler for exceptions which report their pc
@@ -1501,6 +1475,12 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.set_anchor(ANCHOR_DIV_OVERFLOW);
         self.emit_set_exception_kind(EbpfError::DivideOverflow);
         self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 5)));
+
+        // See `ANCHOR_INTERNAL_FUNCTION_CALL_REG` for more details.
+        self.set_anchor(ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION);
+        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(-8, RSP, 0))); // Retrieve the current program counter from the stack
+        self.emit_ins(X86Instruction::pop(REGISTER_MAP[0])); // Restore the clobbered REGISTER_MAP[0]
+        // Fall through
 
         // Handler for EbpfError::UnsupportedInstruction
         self.set_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION);
@@ -1540,7 +1520,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         // Routine for prologue of emit_internal_call()
         self.set_anchor(ANCHOR_INTERNAL_FUNCTION_CALL_PROLOGUE);
         self.emit_validate_instruction_count(None);
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, RSP, 8 * (SCRATCH_REGS + 1) as i64, None)); // alloca
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 8 * (SCRATCH_REGS + 1) as i64, None)); // alloca
         self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_SCRATCH, RSP, X86IndirectAccess::OffsetIndexShift(0, RSP, 0))); // Save original REGISTER_SCRATCH
         self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(8 * (SCRATCH_REGS + 1) as i32, RSP, 0))); // Load return address
         for (i, reg) in REGISTER_MAP.iter().skip(FIRST_SCRATCH_REG).take(SCRATCH_REGS).enumerate() {
@@ -1551,7 +1531,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::xchg(OperandSize::S64, REGISTER_SCRATCH, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // Push return address and restore original REGISTER_SCRATCH
         // Increase env.call_depth
         let call_depth_access = X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::CallDepth));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, REGISTER_PTR_TO_VM, 1, Some(call_depth_access))); // env.call_depth += 1;
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, REGISTER_PTR_TO_VM, 1, Some(call_depth_access))); // env.call_depth += 1;
         // If env.call_depth == self.config.max_call_depth, throw CallDepthExceeded
         self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S32, REGISTER_PTR_TO_VM, self.config.max_call_depth as i64, Some(call_depth_access)));
         self.emit_ins(X86Instruction::conditional_jump_immediate(0x83, self.relative_to_anchor(ANCHOR_CALL_DEPTH_EXCEEDED, 6)));
@@ -1559,7 +1539,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         if !self.executable.get_sbpf_version().dynamic_stack_frames() {
             // With fixed frames we start the new frame at the next fixed offset
             let stack_frame_size = self.config.stack_frame_size as i64 * if self.config.enable_stack_frame_gaps { 2 } else { 1 };
-            self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 0, REGISTER_MAP[FRAME_PTR_REG], stack_frame_size, None)); // REGISTER_MAP[FRAME_PTR_REG] += stack_frame_size;
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, REGISTER_MAP[FRAME_PTR_REG], stack_frame_size, None)); // REGISTER_MAP[FRAME_PTR_REG] += stack_frame_size;
         }
         self.emit_ins(X86Instruction::return_near());
 
@@ -1570,58 +1550,50 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::push(REGISTER_MAP[0], None));
         // Calculate offset relative to program_vm_addr
         self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], self.program_vm_addr as i64));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, REGISTER_MAP[0], REGISTER_SCRATCH, 0, None)); // guest_target_address -= self.program_vm_addr;
-        // Force alignment of guest_target_address
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 4, REGISTER_SCRATCH, !(INSN_SIZE as i64 - 1), None)); // guest_target_address &= !(INSN_SIZE - 1);
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, REGISTER_MAP[0], REGISTER_SCRATCH, None)); // guest_target_pc = guest_target_address - self.program_vm_addr;
+        // Force alignment of guest_target_pc
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 4, REGISTER_SCRATCH, !(INSN_SIZE as i64 - 1), None)); // guest_target_pc &= !(INSN_SIZE - 1);
         // Bound check
-        // if(guest_target_address >= number_of_instructions * INSN_SIZE) throw CALL_OUTSIDE_TEXT_SEGMENT;
+        // if(guest_target_pc >= number_of_instructions * INSN_SIZE) throw CALL_OUTSIDE_TEXT_SEGMENT;
         let number_of_instructions = self.result.pc_section.len();
-        self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, REGISTER_SCRATCH, (number_of_instructions * INSN_SIZE) as i64, None)); // guest_target_address.cmp(number_of_instructions * INSN_SIZE)
+        self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S64, REGISTER_SCRATCH, (number_of_instructions * INSN_SIZE) as i64, None)); // guest_target_pc.cmp(number_of_instructions * INSN_SIZE)
         self.emit_ins(X86Instruction::conditional_jump_immediate(0x83, self.relative_to_anchor(ANCHOR_CALL_OUTSIDE_TEXT_SEGMENT, 6)));
-        // First half of self.emit_profile_instruction_count(false, None);
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2b, REGISTER_INSTRUCTION_METER, RSP, 0, Some(X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)))); // instruction_meter -= guest_current_pc;
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x81, 5, REGISTER_INSTRUCTION_METER, 1, None)); // instruction_meter -= 1;
-        // Load host target_address from self.result.pc_section
-        debug_assert_eq!(INSN_SIZE, 8); // Because the instruction size is also the slot size we do not need to shift the offset
-        self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], self.result.pc_section.as_ptr() as i64)); // host_target_address = self.result.pc_section;
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, REGISTER_MAP[0], 0, None)); // host_target_address += guest_target_address;
-        self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_MAP[0], REGISTER_MAP[0], X86IndirectAccess::Offset(0))); // host_target_address = self.result.pc_section[host_target_address / 8];
         // Calculate the guest_target_pc (dst / INSN_SIZE) to update REGISTER_INSTRUCTION_METER
-        // and as target_pc for potential ANCHOR_CALL_UNSUPPORTED_INSTRUCTION
+        // and as target_pc for potential ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION
         let shift_amount = INSN_SIZE.trailing_zeros();
         debug_assert_eq!(INSN_SIZE, 1 << shift_amount);
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0xc1, 5, REGISTER_SCRATCH, shift_amount as i64, None)); // guest_target_pc /= INSN_SIZE;
-        // Second half of self.emit_profile_instruction_count(false, None);
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, 0, None)); // instruction_meter += guest_target_pc;
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, REGISTER_SCRATCH, shift_amount as i64, None)); // guest_target_pc /= INSN_SIZE;
+        // Load host_target_address offset from self.result.pc_section
+        self.emit_ins(X86Instruction::load_immediate(REGISTER_MAP[0], self.result.pc_section.as_ptr() as i64)); // host_target_address = self.result.pc_section;
+        self.emit_ins(X86Instruction::load(OperandSize::S32, REGISTER_MAP[0], REGISTER_MAP[0], X86IndirectAccess::OffsetIndexShift(0, REGISTER_SCRATCH, 2))); // host_target_address = self.result.pc_section[guest_target_pc];
+        // Check destination is valid
+        self.emit_ins(X86Instruction::test_immediate(OperandSize::S32, REGISTER_MAP[0], 1 << 31, None)); // host_target_address & (1 << 31)
+        self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION, 6))); // If host_target_address & (1 << 31) != 0, throw UnsupportedInstruction
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S32, 0x81, 4, REGISTER_MAP[0], i32::MAX as i64, None)); // host_target_address &= (1 << 31) - 1;
+        // A version of `self.emit_profile_instruction_count(None);` which reads self.pc from the stack
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2b, REGISTER_INSTRUCTION_METER, RSP, Some(X86IndirectAccess::OffsetIndexShift(-8, RSP, 0)))); // instruction_meter -= guest_current_pc;
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, REGISTER_INSTRUCTION_METER, 1, None)); // instruction_meter -= 1;
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, REGISTER_INSTRUCTION_METER, None)); // instruction_meter += guest_target_pc;
+        // Offset host_target_address by self.result.text_section
+        self.emit_ins(X86Instruction::mov_mmx(OperandSize::S64, REGISTER_SCRATCH, MM0));
+        self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, self.result.text_section.as_ptr() as i64)); // REGISTER_SCRATCH = self.result.text_section;
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, REGISTER_SCRATCH, REGISTER_MAP[0], None)); // host_target_address += self.result.text_section;
+        self.emit_ins(X86Instruction::mov_mmx(OperandSize::S64, MM0, REGISTER_SCRATCH));
         // Restore the clobbered REGISTER_MAP[0]
         self.emit_ins(X86Instruction::xchg(OperandSize::S64, REGISTER_MAP[0], RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // Swap REGISTER_MAP[0] and host_target_address
         self.emit_ins(X86Instruction::return_near()); // Tail call to host_target_address
 
-        // If callx lands in an invalid address, we must undo the changes in the instruction meter
-        // so that we can correctly calculate the number of executed instructions for error handling.
-        self.set_anchor(ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION);
-        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, REGISTER_MAP[0]));
-        // Retrieve the current program counter from the stack. `return_near` popped an element from the stack,
-        // so the offset is 16. Check `ANCHOR_INTERNAL_FUNCTION_CALL_REG` for more details.
-        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(-16, RSP, 0)));
-        self.emit_undo_profile_instruction_count(Value::Register(REGISTER_MAP[0]));
-        self.emit_ins(X86Instruction::jump_immediate(self.relative_to_anchor(ANCHOR_CALL_UNSUPPORTED_INSTRUCTION, 5)));
-
         // Translates a vm memory address to a host memory address
-        for (access_type, len) in &[
-            (AccessType::Load, 1i32),
-            (AccessType::Load, 2i32),
-            (AccessType::Load, 4i32),
-            (AccessType::Load, 8i32),
-            (AccessType::Store, 1i32),
-            (AccessType::Store, 2i32),
-            (AccessType::Store, 4i32),
-            (AccessType::Store, 8i32),
+        let lower_key = self.immediate_value_key as i32 as i64;
+        for (anchor_base, len) in &[
+            (0, 1i32), (0, 2i32), (0, 4i32), (0, 8i32),
+            (4, 1i32), (4, 2i32), (4, 4i32), (4, 8i32),
+            (8, 1i32), (8, 2i32), (8, 4i32), (8, 8i32),
         ] {
-            let target_offset = len.trailing_zeros() as usize + 4 * (*access_type as usize);
+            let target_offset = *anchor_base + len.trailing_zeros() as usize;
             self.set_anchor(ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset);
             // call MemoryMapping::(load|store) storing the result in RuntimeEnvironmentSlot::ProgramResult
-            if *access_type == AccessType::Load {
+            if *anchor_base == 0 { // AccessType::Load
                 let load = match len {
                     1 => MemoryMapping::load::<u8> as *const u8 as i64,
                     2 => MemoryMapping::load::<u16> as *const u8 as i64,
@@ -1635,7 +1607,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
                     Argument { index: 1, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping), false) },
                     Argument { index: 0, value: Value::RegisterPlusConstant32(REGISTER_PTR_TO_VM, self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult), false) },
                 ], None);
-            } else {
+            } else { // AccessType::Store
+                if *anchor_base == 8 {
+                    // Second half of emit_sanitized_load_immediate(stack_slot_of_value_to_store, constant)
+                    self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, lower_key, Some(X86IndirectAccess::OffsetIndexShift(-96, RSP, 0))));
+                }
                 let store = match len {
                     1 => MemoryMapping::store::<u8> as *const u8 as i64,
                     2 => MemoryMapping::store::<u16> as *const u8 as i64,
@@ -1658,8 +1634,10 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.emit_ins(X86Instruction::xchg(OperandSize::S64, REGISTER_SCRATCH, RSP, Some(X86IndirectAccess::OffsetIndexShift(0, RSP, 0)))); // Swap return address and self.pc
             self.emit_ins(X86Instruction::conditional_jump_immediate(0x85, self.relative_to_anchor(ANCHOR_THROW_EXCEPTION, 6)));
 
-            // unwrap() the result into REGISTER_SCRATCH
-            self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, REGISTER_SCRATCH, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult) + std::mem::size_of::<u64>() as i32)));
+            if *anchor_base == 0 { // AccessType::Load
+                // unwrap() the result into REGISTER_SCRATCH
+                self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, REGISTER_SCRATCH, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::ProgramResult) + std::mem::size_of::<u64>() as i32)));
+            }
 
             self.emit_ins(X86Instruction::return_near());
         }
@@ -1684,7 +1662,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         let instruction_end = unsafe { self.result.text_section.as_ptr().add(self.offset_in_text_section).add(instruction_length) };
         let destination = if self.result.pc_section[target_pc] != 0 {
             // Backward jump
-            self.result.pc_section[target_pc] as *const u8
+            &self.result.text_section[self.result.pc_section[target_pc] as usize & (i32::MAX as u32 as usize)] as *const u8
         } else {
             // Forward jump, needs relocation
             self.text_section_jumps.push(Jump { location: unsafe { instruction_end.sub(4) }, target_pc });
@@ -1697,224 +1675,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     fn resolve_jumps(&mut self) {
         // Relocate forward jumps
         for jump in &self.text_section_jumps {
-            let destination = self.result.pc_section[jump.target_pc] as *const u8;
+            let destination = &self.result.text_section[self.result.pc_section[jump.target_pc] as usize & (i32::MAX as u32 as usize)] as *const u8;
             let offset_value = 
                 unsafe { destination.offset_from(jump.location) } as i32 // Relative jump
                 - mem::size_of::<i32>() as i32; // Jump from end of instruction
             unsafe { ptr::write_unaligned(jump.location as *mut i32, offset_value); }
-        }
-        // Patch addresses to which `callx` may raise an unsupported instruction error
-        let call_unsupported_instruction = self.anchors[ANCHOR_CALL_REG_UNSUPPORTED_INSTRUCTION] as usize;
-        if self.executable.get_sbpf_version().static_syscalls() {
-            let mut prev_pc = 0;
-            for current_pc in self.executable.get_function_registry().keys() {
-                if current_pc as usize >= self.result.pc_section.len() {
-                    break;
-                }
-                for pc in prev_pc..current_pc as usize {
-                    self.result.pc_section[pc] = call_unsupported_instruction;
-                }
-                prev_pc = current_pc as usize + 1;
-            }
-            for pc in prev_pc..self.result.pc_section.len() {
-                self.result.pc_section[pc] = call_unsupported_instruction;
-            }
-        }
-    }
-}
-
-#[cfg(all(test, target_arch = "x86_64", not(target_os = "windows")))]
-mod tests {
-    use super::*;
-    use crate::{
-        program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
-        syscalls,
-        vm::TestContextObject,
-    };
-    use byteorder::{ByteOrder, LittleEndian};
-    use std::sync::Arc;
-
-    #[test]
-    fn test_runtime_environment_slots() {
-        let executable = create_mockup_executable(Config::default(), &[]);
-        let mut context_object = TestContextObject::new(0);
-        let env = EbpfVm::new(
-            executable.get_loader().clone(),
-            executable.get_sbpf_version(),
-            &mut context_object,
-            MemoryMapping::new_identity(),
-            0,
-        );
-
-        macro_rules! check_slot {
-            ($env:expr, $entry:ident, $slot:ident) => {
-                assert_eq!(
-                    unsafe {
-                        std::ptr::addr_of!($env.$entry)
-                            .cast::<u64>()
-                            .offset_from(std::ptr::addr_of!($env).cast::<u64>()) as usize
-                    },
-                    RuntimeEnvironmentSlot::$slot as usize,
-                );
-            };
-        }
-
-        check_slot!(env, host_stack_pointer, HostStackPointer);
-        check_slot!(env, call_depth, CallDepth);
-        check_slot!(env, context_object_pointer, ContextObjectPointer);
-        check_slot!(env, previous_instruction_meter, PreviousInstructionMeter);
-        check_slot!(env, due_insn_count, DueInsnCount);
-        check_slot!(env, stopwatch_numerator, StopwatchNumerator);
-        check_slot!(env, stopwatch_denominator, StopwatchDenominator);
-        check_slot!(env, registers, Registers);
-        check_slot!(env, program_result, ProgramResult);
-        check_slot!(env, memory_mapping, MemoryMapping);
-    }
-
-    fn create_mockup_executable(config: Config, program: &[u8]) -> Executable<TestContextObject> {
-        let sbpf_version = *config.enabled_sbpf_versions.end();
-        let mut loader = BuiltinProgram::new_loader_with_dense_registration(config);
-        loader
-            .register_function("gather_bytes", 1, syscalls::SyscallGatherBytes::vm)
-            .unwrap();
-        let mut function_registry = FunctionRegistry::default();
-        function_registry
-            .register_function(8, *b"function_foo", 8)
-            .unwrap();
-        Executable::<TestContextObject>::from_text_bytes(
-            program,
-            Arc::new(loader),
-            sbpf_version,
-            function_registry,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn test_code_length_estimate() {
-        const INSTRUCTION_COUNT: usize = 256;
-        let mut prog = vec![0; ebpf::INSN_SIZE * INSTRUCTION_COUNT];
-        for pc in 0..INSTRUCTION_COUNT {
-            prog[pc * ebpf::INSN_SIZE] = ebpf::ADD64_IMM;
-        }
-
-        let mut empty_program_machine_code_length_per_version = [0; 4];
-        for sbpf_version in [SBPFVersion::V0, SBPFVersion::V3] {
-            let empty_program_machine_code_length = {
-                let config = Config {
-                    noop_instruction_rate: 0,
-                    enabled_sbpf_versions: sbpf_version..=sbpf_version,
-                    ..Config::default()
-                };
-                let mut executable = create_mockup_executable(config, &prog[0..0]);
-                Executable::<TestContextObject>::jit_compile(&mut executable).unwrap();
-                executable
-                    .get_compiled_program()
-                    .unwrap()
-                    .machine_code_length()
-            };
-            assert!(empty_program_machine_code_length <= MAX_EMPTY_PROGRAM_MACHINE_CODE_LENGTH);
-            empty_program_machine_code_length_per_version[sbpf_version as usize] =
-                empty_program_machine_code_length;
-        }
-
-        let mut instruction_meter_checkpoint_machine_code_length = [0; 2];
-        for (index, machine_code_length) in instruction_meter_checkpoint_machine_code_length
-            .iter_mut()
-            .enumerate()
-        {
-            let config = Config {
-                instruction_meter_checkpoint_distance: index * INSTRUCTION_COUNT * 2,
-                noop_instruction_rate: 0,
-                enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
-                ..Config::default()
-            };
-            let mut executable = create_mockup_executable(config, &prog);
-            Executable::<TestContextObject>::jit_compile(&mut executable).unwrap();
-            *machine_code_length = (executable
-                .get_compiled_program()
-                .unwrap()
-                .machine_code_length()
-                - empty_program_machine_code_length_per_version[0])
-                / INSTRUCTION_COUNT;
-        }
-        let instruction_meter_checkpoint_machine_code_length =
-            instruction_meter_checkpoint_machine_code_length[0]
-                - instruction_meter_checkpoint_machine_code_length[1];
-        assert_eq!(
-            instruction_meter_checkpoint_machine_code_length,
-            MACHINE_CODE_PER_INSTRUCTION_METER_CHECKPOINT
-        );
-
-        for sbpf_version in [SBPFVersion::V0, SBPFVersion::V3] {
-            let empty_program_machine_code_length =
-                empty_program_machine_code_length_per_version[sbpf_version as usize];
-
-            for mut opcode in 0x00..=0xFF {
-                let (registers, immediate) = match opcode {
-                    0x85 | 0x8D => (0x88, 8),
-                    0x86 => {
-                        // Put external function calls on a separate loop iteration
-                        opcode = 0x85;
-                        (0x00, 0x91020CDD)
-                    }
-                    0x87 => {
-                        // Put invalid function calls on a separate loop iteration
-                        opcode = 0x85;
-                        (0x88, 0x91020CDD)
-                    }
-                    0x95 => {
-                        // Put a valid syscall
-                        (0, 1)
-                    }
-                    0xD4 | 0xDC => (0x88, 16),
-                    _ => (0x88, 0xFFFFFFFF),
-                };
-                for pc in 0..INSTRUCTION_COUNT {
-                    prog[pc * ebpf::INSN_SIZE] = opcode;
-                    prog[pc * ebpf::INSN_SIZE + 1] = registers;
-                    prog[pc * ebpf::INSN_SIZE + 2] = 0xFF;
-                    prog[pc * ebpf::INSN_SIZE + 3] = 0xFF;
-                    LittleEndian::write_u32(&mut prog[pc * ebpf::INSN_SIZE + 4..], immediate);
-                }
-                let config = Config {
-                    noop_instruction_rate: 0,
-                    enabled_sbpf_versions: sbpf_version..=sbpf_version,
-                    ..Config::default()
-                };
-                let mut executable = create_mockup_executable(config, &prog);
-                let result = Executable::<TestContextObject>::jit_compile(&mut executable);
-                if result.is_err() {
-                    assert!(matches!(
-                        result.unwrap_err(),
-                        EbpfError::UnsupportedInstruction
-                    ));
-                    continue;
-                }
-                let machine_code_length = executable
-                    .get_compiled_program()
-                    .unwrap()
-                    .machine_code_length()
-                    - empty_program_machine_code_length;
-                let instruction_count = if opcode == 0x18 {
-                    // LDDW takes two slots
-                    INSTRUCTION_COUNT / 2
-                } else {
-                    INSTRUCTION_COUNT
-                };
-                let machine_code_length_per_instruction =
-                    machine_code_length as f64 / instruction_count as f64;
-                assert!(
-                    (machine_code_length_per_instruction + 0.5) as usize
-                        <= MAX_MACHINE_CODE_LENGTH_PER_INSTRUCTION
-                );
-                /*println!("opcode={:02X} machine_code_length_per_instruction={}", opcode, machine_code_length_per_instruction);
-                let analysis = crate::static_analysis::Analysis::from_executable(&executable).unwrap();
-                {
-                    let stdout = std::io::stdout();
-                    analysis.disassemble(&mut stdout.lock()).unwrap();
-                }*/
-            }
         }
     }
 }
