@@ -981,7 +981,7 @@ impl<'a> MemoryMapping<'a> {
         config: &'a Config,
         sbpf_version: SBPFVersion,
     ) -> Result<Self, EbpfError> {
-        if config.paged_memory_mapping {
+        if std::mem::size_of::<usize>() != 8 {
             MemoryMapping::new_paged(regions, config, sbpf_version)
         } else if config.aligned_memory_mapping {
             AlignedMemoryMapping::new(regions, config, sbpf_version).map(MemoryMapping::Aligned)
@@ -992,7 +992,7 @@ impl<'a> MemoryMapping<'a> {
 
     /// Creates a new memory mapping with paged tables.
     ///
-    fn new_paged(
+    pub fn new_paged(
         regions: Vec<MemoryRegion>,
         config: &'a Config,
         sbpf_version: SBPFVersion,
@@ -1014,7 +1014,9 @@ impl<'a> MemoryMapping<'a> {
         config: &'a Config,
         sbpf_version: SBPFVersion,
     ) -> Result<Self, EbpfError> {
-        if config.aligned_memory_mapping {
+        if std::mem::size_of::<usize>() != 8 {
+            MemoryMapping::new_paged(regions, config, sbpf_version)
+        } else if config.aligned_memory_mapping {
             AlignedMemoryMapping::new_with_cow(regions, cow_cb, config, sbpf_version)
                 .map(MemoryMapping::Aligned)
         } else {

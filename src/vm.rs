@@ -78,8 +78,8 @@ pub struct Config {
     pub aligned_memory_mapping: bool,
     /// Allowed [SBPFVersion]s
     pub enabled_sbpf_versions: std::ops::RangeInclusive<SBPFVersion>,
-    /// Use paged memory mapping
-    pub paged_memory_mapping: bool,
+    // /// Use paged memory mapping
+    // pub paged_memory_mapping: bool,
 }
 
 impl Config {
@@ -106,7 +106,7 @@ impl Default for Config {
             optimize_rodata: true,
             aligned_memory_mapping: true,
             enabled_sbpf_versions: SBPFVersion::V1..=SBPFVersion::V2,
-            paged_memory_mapping: false,
+            // paged_memory_mapping: false,
         }
     }
 }
@@ -223,9 +223,9 @@ impl DynamicAnalysis {
 #[derive(Copy, Clone, Debug)]
 pub enum Register {
     /// Native 64-bit register
-    Native(u64),       
+    Native(u64),
     /// 32-bit register pair
-    Paged(Register64), 
+    Paged(Register64),
 }
 
 impl Register {
@@ -236,7 +236,7 @@ impl Register {
             Register::Paged(reg64) => reg64.as_u64(),
         }
     }
-    
+
     /// convert to [Register] from a 64-bit integer
     pub fn from_u64(value: u64) -> Self {
         if std::mem::size_of::<usize>() == 8 {
@@ -245,7 +245,7 @@ impl Register {
             Register::Paged(Register64::from_u64(value))
         }
     }
-    
+
     /// Convert a [Register] to a 64 bit integer
     pub fn into_u64(reg: Register) -> u64 {
         reg.to_u64()
@@ -263,7 +263,7 @@ impl Register64 {
     fn as_u64(&self) -> u64 {
         ((self.high as u64) << 32) | (self.low as u64)
     }
-    
+
     fn from_u64(value: u64) -> Self {
         Register64 {
             low: value as u32,
