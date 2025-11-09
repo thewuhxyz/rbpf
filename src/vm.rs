@@ -19,32 +19,37 @@ use crate::{
     interpreter::Interpreter,
     memory_region::MemoryMapping,
     program::{BuiltinFunction, BuiltinProgram, FunctionRegistry, SBPFVersion},
-    static_analysis::Analysis,
+    static_analysis::{Analysis, RegisterTraceEntry},
 };
 use std::{collections::BTreeMap, fmt::Debug};
 
-#[cfg(not(feature = "shuttle-test"))]
-use {
-    rand::{thread_rng, Rng},
-    std::sync::Arc,
-};
-
 #[cfg(feature = "shuttle-test")]
-use shuttle::{
-    rand::{thread_rng, Rng},
-    sync::Arc,
-};
+use shuttle::sync::Arc;
+#[cfg(not(feature = "shuttle-test"))]
+use std::sync::Arc;
+
+#[cfg(all(feature = "jit", not(feature = "shuttle-test")))]
+use rand::{thread_rng, Rng};
+#[cfg(all(feature = "jit", feature = "shuttle-test"))]
+use shuttle::rand::{thread_rng, Rng};
 
 /// Shift the RUNTIME_ENVIRONMENT_KEY by this many bits to the LSB
 ///
 /// 3 bits for 8 Byte alignment, and 1 bit to have encoding space for the RuntimeEnvironment.
+#[cfg(feature = "jit")]
 const PROGRAM_ENVIRONMENT_KEY_SHIFT: u32 = 4;
+#[cfg(feature = "jit")]
 static RUNTIME_ENVIRONMENT_KEY: std::sync::OnceLock<i32> = std::sync::OnceLock::<i32>::new();
 
 /// Returns (and if not done before generates) the encryption key for the VM pointer
 pub fn get_runtime_environment_key() -> i32 {
-    *RUNTIME_ENVIRONMENT_KEY
-        .get_or_init(|| thread_rng().gen::<i32>() >> PROGRAM_ENVIRONMENT_KEY_SHIFT)
+    #[cfg(feature = "jit")]
+    {
+        *RUNTIME_ENVIRONMENT_KEY
+            .get_or_init(|| thread_rng().gen::<i32>() >> PROGRAM_ENVIRONMENT_KEY_SHIFT)
+    }
+    #[cfg(not(feature = "jit"))]
+    0
 }
 
 /// VM configuration settings
@@ -63,13 +68,15 @@ pub struct Config {
     /// Enable instruction meter and limiting
     pub enable_instruction_meter: bool,
     /// Enable instruction tracing
-    pub enable_instruction_tracing: bool,
+    pub enable_register_tracing: bool,
     /// Enable dynamic string allocation for labels
     pub enable_symbol_and_section_labels: bool,
     /// Reject ELF files containing issues that the verifier did not catch before (up to v0.2.21)
     pub reject_broken_elfs: bool,
+    #[cfg(feature = "jit")]
     /// Ratio of native host instructions per random no-op in JIT (0 = OFF)
     pub noop_instruction_rate: u32,
+    #[cfg(feature = "jit")]
     /// Enable disinfection of immediate values and offsets provided by the user in JIT
     pub sanitize_user_provided_values: bool,
     /// Avoid copying read only sections when possible
@@ -96,14 +103,16 @@ impl Default for Config {
             enable_stack_frame_gaps: true,
             instruction_meter_checkpoint_distance: 10000,
             enable_instruction_meter: true,
-            enable_instruction_tracing: false,
+            enable_register_tracing: false,
             enable_symbol_and_section_labels: false,
             reject_broken_elfs: false,
+            #[cfg(feature = "jit")]
             noop_instruction_rate: 256,
+            #[cfg(feature = "jit")]
             sanitize_user_provided_values: true,
             optimize_rodata: true,
-            aligned_memory_mapping: true,
-            enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
+            aligned_memory_mapping: false,
+            enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V4,
         }
     }
 }
@@ -129,8 +138,6 @@ impl<C: ContextObject> Executable<C> {
 
 /// Runtime context
 pub trait ContextObject {
-    /// Called for every instruction executed when tracing is enabled
-    fn trace(&mut self, state: [u64; 12]);
     /// Consume instructions from meter
     fn consume(&mut self, amount: u64);
     /// Get the number of remaining instructions allowed
@@ -147,13 +154,13 @@ pub struct DynamicAnalysis {
 
 impl DynamicAnalysis {
     /// Accumulates a trace
-    pub fn new(trace_log: &[[u64; 12]], analysis: &Analysis) -> Self {
+    pub fn new(register_trace: &[[u64; 12]], analysis: &Analysis) -> Self {
         let mut result = Self {
             edge_counter_max: 0,
             edges: BTreeMap::new(),
         };
         let mut last_basic_block = usize::MAX;
-        for traced_instruction in trace_log.iter() {
+        for traced_instruction in register_trace.iter() {
             let pc = traced_instruction[11] as usize;
             if analysis.cfg_nodes.contains_key(&pc) {
                 let counter = result
@@ -204,6 +211,8 @@ pub enum RuntimeEnvironmentSlot {
     ProgramResult = 19,
     /// [EbpfVm::memory_mapping]
     MemoryMapping = 27,
+    /// [EbpfVm::register_trace]
+    RegisterTrace = 54,
 }
 
 /// A virtual machine to run eBPF programs.
@@ -223,7 +232,8 @@ pub enum RuntimeEnvironmentSlot {
 /// use test_utils::TestContextObject;
 ///
 /// let prog = &[
-///     0x9d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
+///     0x07, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // add64 r10, 0
+///     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00  // exit
 /// ];
 /// let mem = &mut [
 ///     0xaa, 0xbb, 0x11, 0x22, 0xcc, 0xdd
@@ -231,9 +241,9 @@ pub enum RuntimeEnvironmentSlot {
 ///
 /// let loader = std::sync::Arc::new(BuiltinProgram::new_mock());
 /// let function_registry = FunctionRegistry::default();
-/// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, loader.clone(), SBPFVersion::V3, function_registry).unwrap();
+/// let mut executable = Executable::<TestContextObject>::from_text_bytes(prog, loader.clone(), SBPFVersion::V4, function_registry).unwrap();
 /// executable.verify::<RequisiteVerifier>().unwrap();
-/// let mut context_object = TestContextObject::new(1);
+/// let mut context_object = TestContextObject::new(2);
 /// let sbpf_version = executable.get_sbpf_version();
 ///
 /// let mut stack = AlignedMemory::<{ebpf::HOST_ALIGN}>::zero_filled(executable.get_config().stack_size());
@@ -255,7 +265,7 @@ pub enum RuntimeEnvironmentSlot {
 /// let mut vm = EbpfVm::new(loader, sbpf_version, &mut context_object, memory_mapping, stack_len);
 ///
 /// let (instruction_count, result) = vm.execute_program(&executable, true);
-/// assert_eq!(instruction_count, 1);
+/// assert_eq!(instruction_count, 2);
 /// assert_eq!(result.unwrap(), 0);
 /// ```
 #[repr(C)]
@@ -287,6 +297,8 @@ pub struct EbpfVm<'a, C: ContextObject> {
     pub call_frames: Vec<CallFrame>,
     /// Loader built-in program
     pub loader: Arc<BuiltinProgram<C>>,
+    /// Collector for the instruction trace
+    pub register_trace: Vec<RegisterTraceEntry>,
     /// TCP port for the debugger interface
     #[cfg(feature = "debugger")]
     pub debug_port: Option<u16>,
@@ -328,7 +340,10 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
             call_frames: vec![CallFrame::default(); config.max_call_depth],
             loader,
             #[cfg(feature = "debugger")]
-            debug_port: None,
+            debug_port: std::env::var("VM_DEBUG_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok()),
+            register_trace: Vec::default(),
         }
     }
 
@@ -341,7 +356,6 @@ impl<'a, C: ContextObject> EbpfVm<'a, C> {
         interpreted: bool,
     ) -> (u64, ProgramResult) {
         debug_assert!(Arc::ptr_eq(&self.loader, executable.get_loader()));
-        self.registers[1] = ebpf::MM_INPUT_START;
         self.registers[11] = executable.get_entrypoint_instruction_offset() as u64;
         let config = executable.get_config();
         let initial_insn_count = self.context_object_pointer.get_remaining();

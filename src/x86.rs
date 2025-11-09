@@ -114,7 +114,7 @@ impl X86Instruction {
         immediate: 0,
     };
 
-    #[inline]
+    #[inline(always)]
     pub fn emit<C: ContextObject>(&self, jit: &mut JitCompiler<C>) {
         debug_assert!(!matches!(self.size, OperandSize::S0));
         let mut rex = X86Rex {
@@ -197,9 +197,9 @@ impl X86Instruction {
     }
 
     /// Arithmetic or logic
-    #[inline]
-    pub const fn alu(
+    pub const fn alu_escaped(
         size: OperandSize,
+        opcode_escape_sequence: u8,
         opcode: u8,
         source: X86Register,
         destination: X86Register,
@@ -208,6 +208,7 @@ impl X86Instruction {
         exclude_operand_sizes!(size, OperandSize::S0 | OperandSize::S8 | OperandSize::S16);
         Self {
             size,
+            opcode_escape_sequence,
             opcode,
             first_operand: source as u8,
             second_operand: destination as u8,
@@ -217,9 +218,9 @@ impl X86Instruction {
     }
 
     /// Arithmetic or logic
-    #[inline]
-    pub const fn alu_immediate(
+    pub const fn alu_immediate_escaped(
         size: OperandSize,
+        opcode_escape_sequence: u8,
         opcode: u8,
         opcode_extension: u8,
         destination: X86Register,
@@ -229,6 +230,7 @@ impl X86Instruction {
         exclude_operand_sizes!(size, OperandSize::S0 | OperandSize::S8 | OperandSize::S16);
         Self {
             size,
+            opcode_escape_sequence,
             opcode,
             first_operand: opcode_extension,
             second_operand: destination as u8,
@@ -244,8 +246,38 @@ impl X86Instruction {
         }
     }
 
+    /// Arithmetic or logic
+    pub const fn alu(
+        size: OperandSize,
+        opcode: u8,
+        source: X86Register,
+        destination: X86Register,
+        indirect: Option<X86IndirectAccess>,
+    ) -> Self {
+        Self::alu_escaped(size, 0, opcode, source, destination, indirect)
+    }
+
+    /// Arithmetic or logic
+    pub const fn alu_immediate(
+        size: OperandSize,
+        opcode: u8,
+        opcode_extension: u8,
+        destination: X86Register,
+        immediate: i64,
+        indirect: Option<X86IndirectAccess>,
+    ) -> Self {
+        Self::alu_immediate_escaped(
+            size,
+            0,
+            opcode,
+            opcode_extension,
+            destination,
+            immediate,
+            indirect,
+        )
+    }
+
     /// Move source to destination
-    #[inline]
     pub const fn mov(size: OperandSize, source: X86Register, destination: X86Register) -> Self {
         exclude_operand_sizes!(size, OperandSize::S0 | OperandSize::S8 | OperandSize::S16);
         Self {
@@ -258,7 +290,6 @@ impl X86Instruction {
     }
 
     /// Move source to destination
-    #[inline]
     pub const fn mov_with_sign_extension(
         size: OperandSize,
         source: X86Register,
@@ -276,7 +307,6 @@ impl X86Instruction {
 
     /// Move to / from / between MMX (float mantissa)
     #[allow(dead_code)]
-    #[inline]
     pub const fn mov_mmx(size: OperandSize, source: X86Register, destination: X86Register) -> Self {
         exclude_operand_sizes!(
             size,
@@ -305,7 +335,6 @@ impl X86Instruction {
     }
 
     /// Conditionally move source to destination
-    #[inline]
     pub const fn cmov(
         size: OperandSize,
         condition: u8,
@@ -324,7 +353,6 @@ impl X86Instruction {
     }
 
     /// Swap source and destination
-    #[inline]
     pub const fn xchg(
         size: OperandSize,
         source: X86Register,
@@ -346,7 +374,6 @@ impl X86Instruction {
     }
 
     /// Swap byte order of destination
-    #[inline]
     pub const fn bswap(size: OperandSize, destination: X86Register) -> Self {
         exclude_operand_sizes!(size, OperandSize::S0 | OperandSize::S8);
         match size {
@@ -371,7 +398,6 @@ impl X86Instruction {
     }
 
     /// Test source and destination
-    #[inline]
     pub const fn test(
         size: OperandSize,
         source: X86Register,
@@ -394,7 +420,6 @@ impl X86Instruction {
     }
 
     /// Test immediate and destination
-    #[inline]
     pub const fn test_immediate(
         size: OperandSize,
         destination: X86Register,
@@ -423,7 +448,6 @@ impl X86Instruction {
     }
 
     /// Compare source and destination
-    #[inline]
     pub const fn cmp(
         size: OperandSize,
         source: X86Register,
@@ -446,7 +470,6 @@ impl X86Instruction {
     }
 
     /// Compare immediate and destination
-    #[inline]
     pub const fn cmp_immediate(
         size: OperandSize,
         destination: X86Register,
@@ -475,7 +498,6 @@ impl X86Instruction {
     }
 
     /// Load effective address of source into destination
-    #[inline]
     pub const fn lea(
         size: OperandSize,
         source: X86Register,
@@ -497,7 +519,6 @@ impl X86Instruction {
     }
 
     /// Convert word to doubleword or doubleword to quadword
-    #[inline]
     pub const fn sign_extend_rax_rdx(size: OperandSize) -> Self {
         exclude_operand_sizes!(size, OperandSize::S0 | OperandSize::S8 | OperandSize::S16);
         Self {
@@ -509,7 +530,6 @@ impl X86Instruction {
     }
 
     /// Load destination from [source + offset]
-    #[inline]
     pub const fn load(
         size: OperandSize,
         source: X86Register,
@@ -540,7 +560,6 @@ impl X86Instruction {
     }
 
     /// Store source in [destination + offset]
-    #[inline]
     pub const fn store(
         size: OperandSize,
         source: X86Register,
@@ -562,7 +581,6 @@ impl X86Instruction {
     }
 
     /// Load destination from immediate
-    #[inline]
     pub const fn load_immediate(destination: X86Register, immediate: i64) -> Self {
         let mut size = OperandSize::S64;
         if immediate >= 0 {
@@ -584,7 +602,7 @@ impl X86Instruction {
         // Load full u64 imm into u64 reg
         Self {
             size,
-            opcode: 0xb8 | ((destination as u8) & 0b111),
+            opcode: (0xb8 | ((destination as u8) & 0b111)),
             modrm: false,
             second_operand: destination as u8,
             immediate_size: size,
@@ -594,7 +612,6 @@ impl X86Instruction {
     }
 
     /// Store sign-extended immediate in destination
-    #[inline]
     pub const fn store_immediate(
         size: OperandSize,
         destination: X86Register,
@@ -621,7 +638,6 @@ impl X86Instruction {
     }
 
     /// Push source onto the stack
-    #[inline]
     pub const fn push_immediate(size: OperandSize, immediate: i32) -> Self {
         exclude_operand_sizes!(size, OperandSize::S0 | OperandSize::S16);
         Self {
@@ -642,7 +658,6 @@ impl X86Instruction {
     }
 
     /// Push source onto the stack
-    #[inline]
     pub const fn push(source: X86Register, indirect: Option<X86IndirectAccess>) -> Self {
         if indirect.is_none() {
             Self {
@@ -666,7 +681,6 @@ impl X86Instruction {
     }
 
     /// Pop from the stack into destination
-    #[inline]
     pub const fn pop(destination: X86Register) -> Self {
         Self {
             size: OperandSize::S32,
@@ -678,7 +692,6 @@ impl X86Instruction {
     }
 
     /// Jump to relative destination on condition
-    #[inline]
     pub const fn conditional_jump_immediate(opcode: u8, relative_destination: i32) -> Self {
         Self {
             size: OperandSize::S32,
@@ -692,7 +705,6 @@ impl X86Instruction {
     }
 
     /// Jump to relative destination
-    #[inline]
     pub const fn jump_immediate(relative_destination: i32) -> Self {
         Self {
             size: OperandSize::S32,
@@ -706,7 +718,6 @@ impl X86Instruction {
 
     /// Jump to absolute destination
     #[allow(dead_code)]
-    #[inline]
     pub const fn jump_reg(destination: X86Register, indirect: Option<X86IndirectAccess>) -> Self {
         Self {
             size: OperandSize::S64,
@@ -719,7 +730,6 @@ impl X86Instruction {
     }
 
     /// Push RIP and jump to relative destination
-    #[inline]
     pub const fn call_immediate(relative_destination: i32) -> Self {
         Self {
             size: OperandSize::S32,
@@ -732,7 +742,6 @@ impl X86Instruction {
     }
 
     /// Push RIP and jump to absolute destination
-    #[inline]
     pub const fn call_reg(destination: X86Register, indirect: Option<X86IndirectAccess>) -> Self {
         Self {
             size: OperandSize::S64,
@@ -745,7 +754,6 @@ impl X86Instruction {
     }
 
     /// Pop RIP
-    #[inline]
     pub const fn return_near() -> Self {
         Self {
             size: OperandSize::S32,
@@ -757,7 +765,6 @@ impl X86Instruction {
 
     /// No operation
     #[allow(dead_code)]
-    #[inline]
     pub const fn noop() -> Self {
         Self {
             size: OperandSize::S32,
@@ -769,7 +776,6 @@ impl X86Instruction {
 
     /// Trap / software interrupt
     #[allow(dead_code)]
-    #[inline]
     pub const fn interrupt(immediate: u8) -> Self {
         if immediate == 3 {
             Self {
@@ -791,7 +797,6 @@ impl X86Instruction {
     }
 
     /// rdtsc
-    #[inline]
     pub const fn cycle_count() -> Self {
         Self {
             size: OperandSize::S32,
@@ -804,7 +809,6 @@ impl X86Instruction {
 
     /// lfence / sfence / mfence
     #[allow(dead_code)]
-    #[inline]
     pub const fn fence(fence_type: FenceType) -> Self {
         Self {
             size: OperandSize::S32,

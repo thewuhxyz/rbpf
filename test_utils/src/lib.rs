@@ -13,8 +13,8 @@ use solana_sbpf::{
     ebpf::{self, HOST_ALIGN},
     elf::Executable,
     error::EbpfError,
-    memory_region::{MemoryCowCallback, MemoryMapping, MemoryRegion},
-    static_analysis::TraceLogEntry,
+    memory_region::{AccessViolationHandler, MemoryMapping, MemoryRegion},
+    static_analysis::RegisterTraceEntry,
     vm::ContextObject,
 };
 
@@ -23,17 +23,11 @@ pub mod syscalls;
 /// Simple instruction meter for testing
 #[derive(Debug, Clone, Default)]
 pub struct TestContextObject {
-    /// Contains the register state at every instruction in order of execution
-    pub trace_log: Vec<TraceLogEntry>,
     /// Maximal amount of instructions which still can be executed
     pub remaining: u64,
 }
 
 impl ContextObject for TestContextObject {
-    fn trace(&mut self, state: [u64; 12]) {
-        self.trace_log.push(state);
-    }
-
     fn consume(&mut self, amount: u64) {
         self.remaining = self.remaining.saturating_sub(amount);
     }
@@ -46,28 +40,27 @@ impl ContextObject for TestContextObject {
 impl TestContextObject {
     /// Initialize with instruction meter
     pub fn new(remaining: u64) -> Self {
-        Self {
-            trace_log: Vec::new(),
-            remaining,
-        }
+        Self { remaining }
     }
+}
 
-    /// Compares an interpreter trace and a JIT trace.
-    ///
-    /// The log of the JIT can be longer because it only validates the instruction meter at branches.
-    pub fn compare_trace_log(interpreter: &Self, jit: &Self) -> bool {
-        let interpreter = interpreter.trace_log.as_slice();
-        let mut jit = jit.trace_log.as_slice();
-        if jit.len() > interpreter.len() {
-            jit = &jit[0..interpreter.len()];
-        }
-        interpreter == jit
+/// Compares an interpreter trace and a JIT trace.
+///
+/// The log of the JIT can be longer because it only validates the instruction meter at branches.
+pub fn compare_register_trace(
+    interpreter: &[RegisterTraceEntry],
+    mut jit: &[RegisterTraceEntry],
+) -> bool {
+    if jit.len() > interpreter.len() {
+        jit = &jit[0..interpreter.len()];
     }
+    interpreter == jit
 }
 
 // Assembly code and data for tcp_sack testcases.
 
 pub const PROG_TCP_PORT_80: &str = "
+    add64 r10, 0
     ldxb r2, [r1+0xc]
     ldxb r3, [r1+0xd]
     lsh64 r3, 0x8
@@ -89,6 +82,7 @@ pub const PROG_TCP_PORT_80: &str = "
     exit";
 
 pub const TCP_SACK_ASM: &str = "
+    add64 r10, 0
     ldxb r2, [r1+12]
     ldxb r3, [r1+13]
     lsh r3, 0x8
@@ -134,22 +128,23 @@ pub const TCP_SACK_ASM: &str = "
     mov r0, 0x1
     exit";
 
-pub const TCP_SACK_BIN: [u8; 352] = [
-    0x2c, 0x12, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, //
-    0x2c, 0x13, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, //
+pub const TCP_SACK_BIN: [u8; 360] = [
+    0x07, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x71, 0x12, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x71, 0x13, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x67, 0x03, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, //
     0x4f, 0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x55, 0x03, 0x25, 0x00, 0x08, 0x00, 0x00, 0x00, //
-    0x2c, 0x12, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x71, 0x12, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x55, 0x02, 0x23, 0x00, 0x06, 0x00, 0x00, 0x00, //
-    0x2c, 0x12, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x71, 0x12, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x07, 0x01, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, //
     0x57, 0x02, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, //
     0x67, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
     0x0f, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-    0x3c, 0x14, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x69, 0x14, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x07, 0x01, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, //
     0x77, 0x04, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, //
     0x57, 0x04, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, //
@@ -163,7 +158,7 @@ pub const TCP_SACK_BIN: [u8; 352] = [
     0xc7, 0x05, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, //
     0xbf, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x0f, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-    0x2c, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x71, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x15, 0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, //
     0x15, 0x05, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0xbf, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
@@ -171,14 +166,14 @@ pub const TCP_SACK_BIN: [u8; 352] = [
     0x05, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x07, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
     0xbf, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-    0x2c, 0x43, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x71, 0x43, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x0f, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x67, 0x03, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, //
     0xc7, 0x03, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, //
     0x6d, 0x32, 0xee, 0xff, 0x00, 0x00, 0x00, 0x00, //
     0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0xb7, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
-    0x9d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
 ];
 
 pub const TCP_SACK_MATCH: [u8; 78] = [
@@ -211,7 +206,7 @@ pub fn create_memory_mapping<'a, C: ContextObject>(
     stack: &'a mut AlignedMemory<{ HOST_ALIGN }>,
     heap: &'a mut AlignedMemory<{ HOST_ALIGN }>,
     additional_regions: Vec<MemoryRegion>,
-    cow_cb: Option<MemoryCowCallback>,
+    access_violation_handler: Option<AccessViolationHandler>,
 ) -> Result<MemoryMapping<'a>, EbpfError> {
     let config = executable.get_config();
     let sbpf_version = executable.get_sbpf_version();
@@ -232,16 +227,23 @@ pub fn create_memory_mapping<'a, C: ContextObject>(
     .chain(additional_regions.into_iter())
     .collect();
 
-    Ok(if let Some(cow_cb) = cow_cb {
-        MemoryMapping::new_with_cow(regions, cow_cb, config, sbpf_version)?
-    } else {
-        MemoryMapping::new(regions, config, sbpf_version)?
-    })
+    Ok(
+        if let Some(access_violation_handler) = access_violation_handler {
+            MemoryMapping::new_with_access_violation_handler(
+                regions,
+                config,
+                sbpf_version,
+                access_violation_handler,
+            )?
+        } else {
+            MemoryMapping::new(regions, config, sbpf_version)?
+        },
+    )
 }
 
 #[macro_export]
 macro_rules! create_vm {
-    ($vm_name:ident, $verified_executable:expr, $context_object:expr, $stack:ident, $heap:ident, $additional_regions:expr, $cow_cb:expr) => {
+    ($vm_name:ident, $verified_executable:expr, $context_object:expr, $stack:ident, $heap:ident, $additional_regions:expr, $access_violation_handler:expr) => {
         let mut $stack = solana_sbpf::aligned_memory::AlignedMemory::zero_filled(
             $verified_executable.get_config().stack_size(),
         );
@@ -252,7 +254,7 @@ macro_rules! create_vm {
             &mut $stack,
             &mut $heap,
             $additional_regions,
-            $cow_cb,
+            $access_violation_handler,
         )
         .unwrap();
         let mut $vm_name = solana_sbpf::vm::EbpfVm::new(
@@ -262,6 +264,7 @@ macro_rules! create_vm {
             memory_mapping,
             stack_len,
         );
+        $vm_name.registers[1] = solana_sbpf::ebpf::MM_INPUT_START;
     };
 }
 
@@ -283,7 +286,7 @@ macro_rules! test_interpreter_and_jit {
             context_object.remaining = INSTRUCTION_METER_BUDGET;
         }
         $executable.verify::<RequisiteVerifier>().unwrap();
-        let (instruction_count_interpreter, result_interpreter, interpreter_final_pc, _tracer_interpreter) = {
+        let (instruction_count_interpreter, result_interpreter, interpreter_final_pc, _trace_interpreter) = {
             let mut mem = $mem;
             let mem_region = MemoryRegion::new_writable(&mut mem, ebpf::MM_INPUT_START);
             let mut context_object = context_object.clone();
@@ -296,12 +299,13 @@ macro_rules! test_interpreter_and_jit {
                 vec![mem_region],
                 None
             );
+            vm.registers[1] = ebpf::MM_INPUT_START;
             let (instruction_count_interpreter, result_interpreter) = vm.execute_program(&$executable, true);
             (
                 instruction_count_interpreter,
                 result_interpreter,
                 vm.registers[11],
-                vm.context_object_pointer.clone(),
+                vm.register_trace.clone(),
             )
         };
         #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
@@ -322,8 +326,9 @@ macro_rules! test_interpreter_and_jit {
             match compilation_result {
                 Err(_) => panic!("{:?}", compilation_result),
                 Ok(()) => {
+                    vm.registers[1] = ebpf::MM_INPUT_START;
                     let (instruction_count_jit, result_jit) = vm.execute_program(&$executable, false);
-                    let tracer_jit = &vm.context_object_pointer;
+                    let trace_jit = &vm.register_trace;
                     let mut diverged = false;
                     if format!("{:?}", result_interpreter) != format!("{:?}", result_jit) {
                         println!(
@@ -346,17 +351,17 @@ macro_rules! test_interpreter_and_jit {
                         );
                         diverged = true;
                     }
-                    if !TestContextObject::compare_trace_log(&_tracer_interpreter, tracer_jit) {
+                    if !compare_register_trace(&_trace_interpreter, trace_jit) {
                         let analysis = Analysis::from_executable(&$executable).unwrap();
                         let stdout = std::io::stdout();
                         analysis
-                            .disassemble_trace_log(
+                            .disassemble_register_trace(
                                 &mut stdout.lock(),
-                                &_tracer_interpreter.trace_log,
+                                &_trace_interpreter,
                             )
                             .unwrap();
                         analysis
-                            .disassemble_trace_log(&mut stdout.lock(), &tracer_jit.trace_log)
+                            .disassemble_register_trace(&mut stdout.lock(), trace_jit)
                             .unwrap();
                         diverged = true;
                     }
@@ -401,7 +406,7 @@ macro_rules! test_interpreter_and_jit_asm {
         #[allow(unused_mut)]
         {
             let mut config = $config;
-            config.enable_instruction_tracing = true;
+            config.enable_register_tracing = true;
             let loader = Arc::new(BuiltinProgram::new_loader(config));
             let mut executable = assemble($source, loader).unwrap();
             test_interpreter_and_jit!(executable, $mem, $context_object, $expected_result);
@@ -428,7 +433,7 @@ macro_rules! test_syscall_asm {
     };
     ($source:expr, $mem:expr, ($($syscall_name:expr => $syscall_function:expr),*$(,)?), $context_object:expr, $expected_result:expr $(,)?) => {
         let mut config = Config {
-            enable_instruction_tracing: true,
+            enable_register_tracing: true,
             ..Config::default()
         };
         for sbpf_version in [SBPFVersion::V0, SBPFVersion::V3] {
@@ -460,7 +465,7 @@ macro_rules! test_interpreter_and_jit_elf {
     };
     ($source:expr, $mem:expr, ($($syscall_name:expr => $syscall_function:expr),* $(,)?), $context_object:expr, $expected_result:expr $(,)?) => {
         let config = Config {
-            enable_instruction_tracing: true,
+            enable_register_tracing: true,
             ..Config::default()
         };
         test_interpreter_and_jit_elf!($source, config, $mem, ($($syscall_name => $syscall_function),*), $context_object, $expected_result);

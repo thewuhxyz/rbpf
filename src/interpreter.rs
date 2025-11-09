@@ -187,8 +187,8 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
         let dst = insn.dst as usize;
         let src = insn.src as usize;
 
-        if config.enable_instruction_tracing {
-            self.vm.context_object_pointer.trace(self.reg);
+        if config.enable_register_tracing {
+            self.vm.register_trace.push(self.reg);
         }
 
         match insn.opc {
@@ -262,8 +262,8 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                                 self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_sub(insn.imm as i32))
             },
             ebpf::SUB32_REG  => self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_sub(self.reg[src] as i32)),
-            ebpf::MUL32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as i32).wrapping_mul(insn.imm as i32)      as u64,
-            ebpf::MUL32_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = (self.reg[dst] as i32).wrapping_mul(self.reg[src] as i32) as u64,
+            ebpf::MUL32_IMM  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_mul(insn.imm as i32)     ),
+            ebpf::MUL32_REG  if !self.executable.get_sbpf_version().enable_pqr() => self.reg[dst] = self.sign_extension((self.reg[dst] as i32).wrapping_mul(self.reg[src] as i32)),
             ebpf::LD_1B_REG  if self.executable.get_sbpf_version().move_memory_instruction_classes() => {
                 let vm_addr = (self.reg[src] as i64).wrapping_add(insn.off as i64) as u64;
                 self.reg[dst] = translate_memory_access!(self, load, vm_addr, u8);
@@ -476,34 +476,60 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                                 self.reg[dst] = (self.reg[dst] as i64 % self.reg[src] as i64) as u64;
             },
 
-            // BPF_JMP class
+            // BPF_JMP32 class
+            ebpf::JEQ32_IMM  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) == insn.imm as u32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JEQ32_REG  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) == self.reg[src] as u32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGT32_IMM  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) >  insn.imm as u32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGT32_REG  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) >  self.reg[src] as u32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGE32_IMM  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) >= insn.imm as u32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGE32_REG  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) >= self.reg[src] as u32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLT32_IMM  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) <  insn.imm as u32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLT32_REG  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) <  self.reg[src] as u32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLE32_IMM  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) <= insn.imm as u32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLE32_REG  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) <= self.reg[src] as u32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSET32_IMM if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) &  insn.imm as u32 != 0      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSET32_REG if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) &  self.reg[src] as u32 != 0 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JNE32_IMM  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) != insn.imm as u32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JNE32_REG  if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as u32) != self.reg[src] as u32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGT32_IMM if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) >  insn.imm as i32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGT32_REG if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) >  self.reg[src] as i32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGE32_IMM if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) >= insn.imm as i32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGE32_REG if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) >= self.reg[src] as i32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLT32_IMM if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) <  insn.imm as i32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLT32_REG if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) <  self.reg[src] as i32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLE32_IMM if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) <= insn.imm as i32           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLE32_REG if self.executable.get_sbpf_version().enable_jmp32() => if (self.reg[dst] as i32) <= self.reg[src] as i32      { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+
+            // BPF_JMP64 class
             ebpf::JA         =>                                                   { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JEQ_IMM    => if  self.reg[dst] == insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JEQ_REG    => if  self.reg[dst] == self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGT_IMM    => if  self.reg[dst] >  insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGT_REG    => if  self.reg[dst] >  self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGE_IMM    => if  self.reg[dst] >= insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JGE_REG    => if  self.reg[dst] >= self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLT_IMM    => if  self.reg[dst] <  insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLT_REG    => if  self.reg[dst] <  self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLE_IMM    => if  self.reg[dst] <= insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JLE_REG    => if  self.reg[dst] <= self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSET_IMM   => if  self.reg[dst] &  insn.imm as u64 != 0         { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSET_REG   => if  self.reg[dst] &  self.reg[src] != 0           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JNE_IMM    => if  self.reg[dst] != insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JNE_REG    => if  self.reg[dst] != self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGT_IMM   => if (self.reg[dst] as i64) >  insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGT_REG   => if (self.reg[dst] as i64) >  self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGE_IMM   => if (self.reg[dst] as i64) >= insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSGE_REG   => if (self.reg[dst] as i64) >= self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLT_IMM   => if (self.reg[dst] as i64) <  insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLT_REG   => if (self.reg[dst] as i64) <  self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLE_IMM   => if (self.reg[dst] as i64) <= insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
-            ebpf::JSLE_REG   => if (self.reg[dst] as i64) <= self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JEQ64_IMM    => if  self.reg[dst] == insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JEQ64_REG    => if  self.reg[dst] == self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGT64_IMM    => if  self.reg[dst] >  insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGT64_REG    => if  self.reg[dst] >  self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGE64_IMM    => if  self.reg[dst] >= insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JGE64_REG    => if  self.reg[dst] >= self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLT64_IMM    => if  self.reg[dst] <  insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLT64_REG    => if  self.reg[dst] <  self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLE64_IMM    => if  self.reg[dst] <= insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JLE64_REG    => if  self.reg[dst] <= self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSET64_IMM   => if  self.reg[dst] &  insn.imm as u64 != 0         { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSET64_REG   => if  self.reg[dst] &  self.reg[src] != 0           { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JNE64_IMM    => if  self.reg[dst] != insn.imm as u64              { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JNE64_REG    => if  self.reg[dst] != self.reg[src]                { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGT64_IMM   => if (self.reg[dst] as i64) >  insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGT64_REG   => if (self.reg[dst] as i64) >  self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGE64_IMM   => if (self.reg[dst] as i64) >= insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSGE64_REG   => if (self.reg[dst] as i64) >= self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLT64_IMM   => if (self.reg[dst] as i64) <  insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLT64_REG   => if (self.reg[dst] as i64) <  self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLE64_IMM   => if (self.reg[dst] as i64) <= insn.imm             { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
+            ebpf::JSLE64_REG   => if (self.reg[dst] as i64) <= self.reg[src] as i64 { next_pc = (next_pc as i64 + insn.off as i64) as u64; },
 
             ebpf::CALL_REG   => {
                 let target_pc = if self.executable.get_sbpf_version().callx_uses_src_reg() {
                     self.reg[src]
+                } else if self.executable.get_sbpf_version().callx_uses_dst_reg() {
+                    self.reg[dst]
                 } else {
                     self.reg[insn.imm as usize]
                 };
@@ -511,31 +537,31 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     return false;
                 }
                 check_pc!(self, next_pc, target_pc.wrapping_sub(self.program_vm_addr) / ebpf::INSN_SIZE as u64);
-                if self.executable.get_sbpf_version().static_syscalls() && self.executable.get_function_registry().lookup_by_key(next_pc as u32).is_none() {
-                    throw_error!(self, EbpfError::UnsupportedInstruction);
-                }
             },
 
             // Do not delegate the check to the verifier, since self.registered functions can be
             // changed after the program has been verified.
             ebpf::CALL_IMM => {
-                if let (false, Some((_, function))) =
-                        (self.executable.get_sbpf_version().static_syscalls(),
-                            self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32)) {
+                let key = self
+                    .executable
+                    .get_sbpf_version()
+                    .calculate_call_imm_target_pc(self.reg[11] as usize, insn.imm);
+                if self.executable.get_sbpf_version().static_syscalls() && insn.src == 1 {
+                    // make BPF to BPF call
+                    if !self.push_frame(config) {
+                        return false;
+                    }
+                    check_pc!(self, next_pc, key as u64);
+                } else if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
                     // SBPFv0 syscall
                     self.reg[0] = match self.dispatch_syscall(function) {
                         ProgramResult::Ok(value) => *value,
                         ProgramResult::Err(_err) => return false,
                     };
                 } else if let Some((_, target_pc)) =
-                        self.executable
-                            .get_function_registry()
-                            .lookup_by_key(
-                                self
-                                    .executable
-                                    .get_sbpf_version()
-                                    .calculate_call_imm_target_pc(self.reg[11] as usize, insn.imm)
-                        ) {
+                    self.executable
+                    .get_function_registry()
+                    .lookup_by_key(key) {
                     // make BPF to BPF call
                     if !self.push_frame(config) {
                         return false;
@@ -545,24 +571,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
                     throw_error!(self, EbpfError::UnsupportedInstruction);
                 }
             }
-            ebpf::SYSCALL if self.executable.get_sbpf_version().static_syscalls() => {
-                if let Some((_, function)) = self.executable.get_loader().get_function_registry().lookup_by_key(insn.imm as u32) {
-                    // SBPFv3 syscall
-                    self.reg[0] = match self.dispatch_syscall(function) {
-                        ProgramResult::Ok(value) => *value,
-                        ProgramResult::Err(_err) => return false,
-                    };
-                } else {
-                    debug_assert!(false, "Invalid syscall should have been detected in the verifier.");
-                }
-            },
-            ebpf::RETURN
-            | ebpf::EXIT       => {
-                if (insn.opc == ebpf::EXIT && self.executable.get_sbpf_version().static_syscalls())
-                    || (insn.opc == ebpf::RETURN && !self.executable.get_sbpf_version().static_syscalls()) {
-                    throw_error!(self, EbpfError::UnsupportedInstruction);
-                }
-
+            ebpf::EXIT       => {
                 if self.vm.call_depth == 0 {
                     if config.enable_instruction_meter && self.vm.due_insn_count > self.vm.previous_instruction_meter {
                         throw_error!(self, EbpfError::ExceededMaxInstructions);
